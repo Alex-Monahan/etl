@@ -152,6 +152,26 @@ def fetch_cached_binary():
     return binary_works()
 
 
+LOCAL_CACHE = "/tmp/etl-poc-binary-cache"
+
+
+def fetch_local_cache():
+    """Container-level cache: a reused flight container keeps /tmp, so a
+    previous run's compiled binary can be reused without git or a rebuild."""
+    gz = f"{LOCAL_CACHE}/{BINARY_GZ}"
+    if not os.path.exists(gz):
+        return False
+    log("found container-local binary cache")
+    sh(f"gunzip -c {gz} > {BIN_PATH} && chmod +x {BIN_PATH}")
+    return binary_works()
+
+
+def save_local_cache():
+    os.makedirs(LOCAL_CACHE, exist_ok=True)
+    sh(f"gzip -1 -c {BIN_PATH} > {LOCAL_CACHE}/{BINARY_GZ}")
+    log(f"saved binary to container-local cache {LOCAL_CACHE}")
+
+
 def compile_in_flight():
     log("=== no usable cached binary: installing rust and compiling (slow path) ===")
     sh(
@@ -159,15 +179,17 @@ def compile_in_flight():
         timeout=900,
     )
     sh("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal", timeout=1200)
-    cargo_env = 'source "$HOME/.cargo/env" && '
+    # /bin/sh is dash on Debian: no `source` builtin, so call cargo by path.
+    # The rustup shim auto-installs the repo's pinned toolchain on first use.
     sh(
-        f"{cargo_env} cd {SRC_DIR} && cargo build --release -p etl-replicator "
+        f'cd {SRC_DIR} && "$HOME/.cargo/bin/cargo" build --release -p etl-replicator '
         "--no-default-features --features ducklake 2>&1 | tail -20",
         timeout=7200,
     )
     sh(f"cp {SRC_DIR}/target/release/etl-replicator {BIN_PATH} && chmod +x {BIN_PATH}")
     if not binary_works():
         raise RuntimeError("freshly compiled binary does not run")
+    save_local_cache()
     push_cache()
 
 
@@ -631,7 +653,7 @@ def main():
     env_recon()
     apt_install()
     clone_repo()
-    if not fetch_cached_binary():
+    if not fetch_cached_binary() and not fetch_local_cache():
         compile_in_flight()
     setup_postgres()
     setup_object_store()
