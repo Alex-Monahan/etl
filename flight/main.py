@@ -219,6 +219,10 @@ def setup_postgres():
     psql("postgres", "alter system set max_wal_senders = 20;")
     psql("postgres", "alter system set max_replication_slots = 20;")
     sh(f"pg_ctlcluster {ver} main restart", timeout=120)
+    # Reset any state left behind by a previous run in a reused container.
+    psql("postgres", "select pg_drop_replication_slot(slot_name) from pg_replication_slots;", check=False)
+    psql("postgres", f"drop database if exists {SOURCE_DB} with (force);", check=False)
+    psql("postgres", f"drop database if exists {CATALOG_DB} with (force);", check=False)
     psql("postgres", f"create database {SOURCE_DB};")
     psql("postgres", f"create database {CATALOG_DB};")
     psql(SOURCE_DB, f"""
@@ -234,21 +238,51 @@ def setup_postgres():
     log(f"wal_level={psql_value('postgres', 'show wal_level;')}")
 
 
-def setup_minio():
-    log("=== starting MinIO (local S3) ===")
-    sh(f"curl -sSL -o {WORK}/minio https://dl.min.io/server/minio/release/linux-amd64/minio && chmod +x {WORK}/minio", timeout=600)
-    sh(f"curl -sSL -o {WORK}/mc https://dl.min.io/client/mc/release/linux-amd64/mc && chmod +x {WORK}/mc", timeout=600)
-    spawn("minio", f"{WORK}/minio server {WORK}/minio-data --address {MINIO_ADDR} --quiet",
-          env={"MINIO_ROOT_USER": MINIO_USER, "MINIO_ROOT_PASSWORD": MINIO_PASS})
-    for _ in range(30):
-        r = subprocess.run(f"curl -s -o /dev/null -w '%{{http_code}}' http://{MINIO_ADDR}/minio/health/ready",
+HAVE_MC = False
+
+
+def _wait_http(url, codes, attempts=30):
+    for _ in range(attempts):
+        r = subprocess.run(f"curl -s -o /dev/null -w '%{{http_code}}' {url}",
                            shell=True, capture_output=True, text=True)
-        if r.stdout.strip() == "200":
-            break
+        if r.stdout.strip() in codes:
+            return True
         time.sleep(1)
-    else:
-        raise RuntimeError("minio did not become ready")
-    sh(f"{WORK}/mc alias set local http://{MINIO_ADDR} {MINIO_USER} {MINIO_PASS} && {WORK}/mc mb local/{BUCKET}")
+    return False
+
+
+def setup_object_store():
+    """Start a local S3 endpoint: MinIO preferred, moto-server as fallback for
+    environments where dl.min.io is unreachable."""
+    global HAVE_MC
+    log("=== starting local S3 (MinIO, moto fallback) ===")
+    sh(f"rm -rf {WORK}/minio-data")
+    try:
+        sh(f"curl -fsSL -o {WORK}/minio https://dl.min.io/server/minio/release/linux-amd64/minio && chmod +x {WORK}/minio", timeout=600)
+        sh(f"head -c 4 {WORK}/minio | grep -q ELF", quiet=True)
+        sh(f"curl -fsSL -o {WORK}/mc https://dl.min.io/client/mc/release/linux-amd64/mc && chmod +x {WORK}/mc", timeout=600)
+        spawn("minio", f"{WORK}/minio server {WORK}/minio-data --address {MINIO_ADDR} --quiet",
+              env={"MINIO_ROOT_USER": MINIO_USER, "MINIO_ROOT_PASSWORD": MINIO_PASS})
+        if not _wait_http(f"http://{MINIO_ADDR}/minio/health/ready", {"200"}):
+            raise RuntimeError("minio did not become ready")
+        sh(f"{WORK}/mc alias set local http://{MINIO_ADDR} {MINIO_USER} {MINIO_PASS} && {WORK}/mc mb local/{BUCKET}")
+        HAVE_MC = True
+        return
+    except Exception as e:
+        log(f"minio unavailable ({e}); falling back to moto server")
+    # --ignore-installed sidesteps distro-owned packages (e.g. Debian PyYAML)
+    # that pip cannot uninstall; do not pipe, so failures are visible.
+    sh("python3 -m pip install -q --ignore-installed PyYAML 'moto[server]' boto3", timeout=600)
+    host, port = MINIO_ADDR.split(":")
+    spawn("moto", f"python3 -m moto.server -H {host} -p {port}")
+    if not _wait_http(f"http://{MINIO_ADDR}/", {"200", "403", "404"}):
+        raise RuntimeError("moto server did not become ready")
+    import boto3
+    s3 = boto3.client("s3", endpoint_url=f"http://{MINIO_ADDR}",
+                      aws_access_key_id=MINIO_USER, aws_secret_access_key=MINIO_PASS,
+                      region_name="us-east-1")
+    s3.create_bucket(Bucket=BUCKET)
+    log(f"moto S3 ready with bucket {BUCKET}")
 
 
 def write_replicator_config():
@@ -281,7 +315,9 @@ pipeline:
   batch:
     max_fill_ms: 1000
 """
-    with open(f"{cfg_dir}/prod.yaml", "w") as f:
+    # dev environment => console logging (prod logs to rotating files under
+    # ./logs, which is useless inside a flight).
+    with open(f"{cfg_dir}/dev.yaml", "w") as f:
         f.write(prod)
     log(f"replicator config written to {cfg_dir}")
     return cfg_dir
@@ -300,7 +336,7 @@ def start_replicator(cfg_dir):
     log("=== starting etl-replicator ===")
     return spawn("replicator", BIN_PATH, env={
         "APP_CONFIG_DIR": cfg_dir,
-        "APP_ENVIRONMENT": "prod",
+        "APP_ENVIRONMENT": "dev",
         "RUST_LOG": os.environ.get("RUST_LOG", "info"),
     })
 
@@ -382,7 +418,8 @@ def verify_ducklake():
             print(f"--- {label} ---\n{con.execute(q).fetchall()}", flush=True)
         except Exception as e:
             log(f"{label} failed: {e}")
-    objs = sh(f"{WORK}/mc ls --recursive local/{BUCKET} | tail -5; {WORK}/mc du local/{BUCKET}", check=False)
+    if HAVE_MC:
+        sh(f"{WORK}/mc ls --recursive local/{BUCKET} | tail -5; {WORK}/mc du local/{BUCKET}", check=False)
     return ok
 
 
@@ -408,7 +445,7 @@ def main():
     if not fetch_cached_binary():
         compile_in_flight()
     setup_postgres()
-    setup_minio()
+    setup_object_store()
     cfg_dir = write_replicator_config()
     seed_initial_rows()
     rep = start_replicator(cfg_dir)

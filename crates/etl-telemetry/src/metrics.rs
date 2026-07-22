@@ -100,24 +100,34 @@ pub fn init_metrics(
     pipeline_id: Option<u64>,
     destination: Option<&str>,
 ) -> Result<(), BuildError> {
-    let mut builder = PrometheusBuilder::new().with_http_listener(std::net::SocketAddr::new(
-        std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-        9000,
-    ));
+    let install = |ip: std::net::IpAddr| {
+        let mut builder =
+            PrometheusBuilder::new().with_http_listener(std::net::SocketAddr::new(ip, 9000));
 
-    if let Some(project_ref) = project_ref {
-        builder = builder.add_global_label("project", project_ref);
+        if let Some(project_ref) = project_ref {
+            builder = builder.add_global_label("project", project_ref);
+        }
+
+        if let Some(pipeline_id) = pipeline_id {
+            builder = builder.add_global_label("pipeline_id", pipeline_id.to_string());
+        }
+
+        if let Some(destination) = destination {
+            builder = builder.add_global_label("destination", destination);
+        }
+
+        builder.install()
+    };
+
+    // Prefer the dual-stack wildcard, but fall back to IPv4 for runtimes
+    // without IPv6 support, where binding `[::]` fails with EAFNOSUPPORT.
+    if let Err(error) = install(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)) {
+        tracing::warn!(
+            error = %error,
+            "failed to bind prometheus exporter on ipv6 wildcard, retrying on ipv4"
+        );
+        install(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))?;
     }
-
-    if let Some(pipeline_id) = pipeline_id {
-        builder = builder.add_global_label("pipeline_id", pipeline_id.to_string());
-    }
-
-    if let Some(destination) = destination {
-        builder = builder.add_global_label("destination", destination);
-    }
-
-    builder.install()?;
 
     Ok(())
 }

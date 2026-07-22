@@ -1,10 +1,13 @@
 {
-  "source_commit": "4a18e048f14f918b7f110893ff2e259ddc81bcc3",
+  "source_commit": "7796784c01ea365b5b12fc96f0faa5b88dcbc636 (pre-commit, see next commit)",
   "target": "x86_64-unknown-linux-gnu",
   "built_on": "Ubuntu 24.04 (glibc 2.39)",
   "min_glibc": "2.39",
   "cargo_features": "ducklake (no default destinations)",
   "cargo_profile": "release",
-  "uncompressed_bytes": 95431544,
-  "built_at_utc": "2026-07-22T06:06:43Z"
+  "uncompressed_bytes": 95434024,
+  "built_at_utc": "2026-07-22T06:19:06Z",
+  "patches": [
+    "init_metrics falls back to IPv4 when IPv6 wildcard bind is unsupported"
+  ]
 }
