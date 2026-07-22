@@ -44,6 +44,10 @@ jobs:
       - name: Build etl-replicator (ducklake only)
         env:
           RUSTFLAGS: "-C panic=abort -C link-arg=-fuse-ld=lld"
+          # Disable release LTO for much faster CI builds; the standalone
+          # replicator does not need cross-crate LTO to function.
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
         run: |
           cargo build --release -p etl-replicator \
             --no-default-features --features ducklake
