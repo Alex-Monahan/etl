@@ -636,6 +636,53 @@ fn build_setup_sql_with_strategy(
     .combined_sql())
 }
 
+/// Directory used for on-demand DuckDB extension installs in environments where
+/// the default home-relative extension directory may not be writable.
+const MOTHERDUCK_EXTENSION_DIRECTORY: &str = "/tmp/duckdb_extensions";
+
+/// Builds the setup plan for a MotherDuck-managed DuckLake catalog.
+///
+/// MotherDuck manages both the catalog metadata and the underlying storage, so
+/// the plan installs the `ducklake` and `motherduck` extensions, attaches the
+/// `ducklake:md:__ducklake_metadata_<db>` catalog without a `DATA_PATH`, and
+/// authenticates using the `motherduck_token` environment variable that the
+/// `motherduck` extension reads on load.
+fn build_motherduck_setup_plan(
+    catalog_url: &Url,
+    data_inlining_row_limit: u64,
+) -> EtlResult<DuckLakeSetupPlan> {
+    let lake_catalog = quote_identifier(LAKE_CATALOG);
+    let steps = vec![
+        DuckLakeSetupStep {
+            label: "configure_writer_session",
+            sql: configure_writer_session_sql(),
+        },
+        DuckLakeSetupStep {
+            label: "load_extensions",
+            sql: format!(
+                "SET extension_directory = {}; INSTALL ducklake; LOAD ducklake; INSTALL \
+                 motherduck; LOAD motherduck;",
+                quote_literal(MOTHERDUCK_EXTENSION_DIRECTORY)
+            ),
+        },
+        DuckLakeSetupStep {
+            label: "attach_catalog",
+            sql: format!(
+                "ATTACH {} AS {lake_catalog} (DATA_INLINING_ROW_LIMIT {}, AUTOMATIC_MIGRATION \
+                 true);",
+                quote_literal(&format!("ducklake:{}", catalog_url.as_str())),
+                data_inlining_row_limit
+            ),
+        },
+        DuckLakeSetupStep {
+            label: "configure_parquet",
+            sql: configure_parquet_settings_sql(),
+        },
+    ];
+
+    Ok(DuckLakeSetupPlan { steps })
+}
+
 fn build_setup_plan_with_strategy(
     catalog_url: &Url,
     data_path: &Url,
@@ -645,6 +692,13 @@ fn build_setup_plan_with_strategy(
     vendored_root: Option<&Path>,
     data_inlining_row_limit: u64,
 ) -> EtlResult<DuckLakeSetupPlan> {
+    // A MotherDuck-managed DuckLake owns its storage, so it needs neither a
+    // data path nor S3 credentials, and it is reached through the `motherduck`
+    // extension rather than `postgres_scanner`/`httpfs`.
+    if matches!(catalog_url.scheme(), "md" | "motherduck") {
+        return build_motherduck_setup_plan(catalog_url, data_inlining_row_limit);
+    }
+
     let catalog_target = catalog_attach_target(catalog_url)?;
     let data_path = validate_data_path(data_path)?;
 

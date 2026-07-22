@@ -201,6 +201,7 @@ mod ducklake {
 
         let DestinationConfig::Ducklake {
             catalog_url,
+            metadata_catalog_url,
             data_path,
             pool_size,
             s3_access_key_id,
@@ -218,7 +219,31 @@ mod ducklake {
             unreachable!("Destination kind should match DuckLake config");
         };
 
-        let s3_config = match (s3_access_key_id, s3_secret_access_key) {
+        // A MotherDuck-managed DuckLake owns its storage and metadata, so it
+        // takes no `data_path` and no S3 credentials. The metadata bookkeeping
+        // catalog is supplied separately via `metadata_catalog_url`.
+        let catalog_url =
+            parse_ducklake_url(catalog_url.expose_secret()).map_err(ReplicatorError::config)?;
+        let is_motherduck = matches!(catalog_url.scheme(), "md" | "motherduck");
+
+        let metadata_catalog_url = match metadata_catalog_url {
+            Some(url) => {
+                Some(parse_ducklake_url(url.expose_secret()).map_err(ReplicatorError::config)?)
+            }
+            None => None,
+        };
+
+        let data_path = if is_motherduck {
+            // Placeholder that is never used by the MotherDuck attach path.
+            parse_ducklake_url("md:managed").map_err(ReplicatorError::config)?
+        } else {
+            parse_ducklake_s3_data_path(data_path).map_err(ReplicatorError::config)?
+        };
+
+        let s3_config = if is_motherduck {
+            None
+        } else {
+            match (s3_access_key_id, s3_secret_access_key) {
             (Some(access_key_id), Some(secret_access_key)) => Some(DucklakeS3Config {
                 access_key_id: access_key_id.expose_secret().to_owned(),
                 secret_access_key: secret_access_key.expose_secret().to_owned(),
@@ -235,6 +260,7 @@ mod ducklake {
                     "DuckLake S3 credentials must include both access key id and secret access key",
                 )));
             }
+            }
         };
 
         let maintenance_mode = match maintenance_mode {
@@ -246,8 +272,9 @@ mod ducklake {
             DuckLakeExternalMaintenanceConfig { mode: maintenance_mode, pipeline_id };
 
         let destination = DuckLakeDestination::new_with_external_maintenance(
-            parse_ducklake_url(catalog_url.expose_secret()).map_err(ReplicatorError::config)?,
-            parse_ducklake_s3_data_path(data_path).map_err(ReplicatorError::config)?,
+            catalog_url,
+            metadata_catalog_url,
+            data_path,
             *pool_size,
             s3_config,
             metadata_schema.clone(),

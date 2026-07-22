@@ -151,8 +151,28 @@ pub enum DestinationConfig {
     },
     Ducklake {
         /// DuckLake catalog URL.
+        ///
+        /// A PostgreSQL URL (`postgres://…`) or local `file:` catalog for a
+        /// self-hosted DuckLake, or a MotherDuck-managed catalog of the form
+        /// `md:__ducklake_metadata_<database>`. When a MotherDuck catalog is
+        /// used, DuckLake storage is managed by MotherDuck and no `data_path`
+        /// or S3 credentials are required.
         catalog_url: SecretString,
+        /// Optional PostgreSQL URL backing the DuckLake metadata bookkeeping
+        /// (the replay-epoch catalog).
+        ///
+        /// Required when [`DestinationConfig::Ducklake::catalog_url`] points at
+        /// a MotherDuck-managed (`md:`) DuckLake, which exposes no PostgreSQL
+        /// endpoint of its own. Ignored for PostgreSQL catalogs, where the
+        /// catalog URL itself backs the metadata pool.
+        #[serde(default)]
+        metadata_catalog_url: Option<SecretString>,
         /// DuckLake data path.
+        ///
+        /// Object-storage or `file:` location for Parquet data in a self-hosted
+        /// DuckLake. Left empty for MotherDuck-managed catalogs, which own their
+        /// storage.
+        #[serde(default)]
         data_path: String,
         /// Size of the DuckDB connection pool.
         #[serde(default = "default_ducklake_pool_size")]
@@ -438,6 +458,7 @@ impl From<DestinationConfig> for DestinationConfigWithoutSecrets {
             }
             DestinationConfig::Ducklake {
                 catalog_url: _,
+                metadata_catalog_url: _,
                 data_path,
                 pool_size,
                 s3_access_key_id: _,
@@ -489,6 +510,7 @@ mod tests {
     fn ducklake_without_secrets_omits_catalog_url() {
         let config = DestinationConfig::Ducklake {
             catalog_url: "postgres://user:pass@localhost:5432/ducklake_catalog".to_owned().into(),
+            metadata_catalog_url: None,
             data_path: "s3://bucket/path".to_owned(),
             pool_size: 4,
             s3_access_key_id: None,
