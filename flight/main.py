@@ -410,7 +410,9 @@ def verify_ducklake():
     log("REPLICATION VERIFIED ✅" if ok else "MISMATCH ❌")
 
     for label, q in [
-        ("sample replicated rows", "select * from lake.public.orders order by id limit 5"),
+        # created_at cast to varchar: timestamptz fetch needs pytz, not installed.
+        ("sample replicated rows",
+         "select id, customer, amount, status, cast(created_at as varchar) from lake.public.orders order by id limit 5"),
         ("updated rows made it", "select count(*) from lake.public.orders where status like 'updated-%'"),
         ("ducklake snapshots", "select count(*) from lake.snapshots()"),
     ]:
@@ -429,6 +431,13 @@ def cleanup():
         if p.poll() is None:
             log(f"terminating {name}")
             p.terminate()
+            if name == "replicator":
+                # Let the replicator finish graceful shutdown before its
+                # source/destination Postgres goes away.
+                for _ in range(20):
+                    if p.poll() is not None:
+                        break
+                    time.sleep(1)
     time.sleep(3)
     for name, p in procs:
         if p.poll() is None:
