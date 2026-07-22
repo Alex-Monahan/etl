@@ -21,8 +21,12 @@ ducklake = ["any-destination", "etl-destinations/ducklake", "etl-maintenance/duc
 iceberg = ["any-destination", "etl-destinations/iceberg"]
 snowflake = ["any-destination", "etl-destinations/snowflake"]
 egress = ["etl/egress", "etl-destinations/egress"]
+# Enables ETL fault-injection failpoints, configured at runtime via the
+# `FAILPOINTS` environment variable. For testing only.
+failpoints = ["etl/failpoints", "dep:fail"]
 
 [dependencies]
+fail = { workspace = true, optional = true }
 
 configcat = { workspace = true }
 etl = { workspace = true }

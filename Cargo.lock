@@ -2186,6 +2186,7 @@ dependencies = [
  "etl-destinations",
  "etl-maintenance",
  "etl-telemetry",
+ "fail",
  "k8s-openapi",
  "metrics",
  "reqwest",

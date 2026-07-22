@@ -55,14 +55,27 @@ jobs:
           cargo build --release -p etl-replicator \
             --no-default-features --features ducklake
           strip target/release/etl-replicator
+          cp target/release/etl-replicator etl-replicator-linux-amd64
 
-      - name: Package binary
+      - name: Build etl-replicator (ducklake + failpoints, testing)
+        env:
+          RUSTFLAGS: "-C panic=abort -C link-arg=-fuse-ld=lld"
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+        run: |
+          cargo build --release -p etl-replicator \
+            --no-default-features --features ducklake,failpoints
+          strip target/release/etl-replicator
+          cp target/release/etl-replicator etl-replicator-linux-amd64-failpoints
+
+      - name: Package binaries
         run: |
           mkdir -p dist
-          cp target/release/etl-replicator dist/etl-replicator-linux-amd64
+          cp etl-replicator-linux-amd64 dist/
+          cp etl-replicator-linux-amd64-failpoints dist/
           cd dist
-          gzip -k -9 etl-replicator-linux-amd64
-          sha256sum etl-replicator-linux-amd64 etl-replicator-linux-amd64.gz > SHA256SUMS
+          gzip -k -9 etl-replicator-linux-amd64 etl-replicator-linux-amd64-failpoints
+          sha256sum etl-replicator-linux-amd64* > SHA256SUMS
           ls -la
 
       - name: Publish release
@@ -74,7 +87,9 @@ jobs:
           gh release delete "$TAG" --yes --cleanup-tag || true
           gh release create "$TAG" \
             --title "MotherDuck-managed DuckLake replicator (linux/amd64)" \
-            --notes "etl-replicator built with the ducklake feature for MotherDuck-managed DuckLake. Commit ${GITHUB_SHA}." \
+            --notes "etl-replicator built with the ducklake feature for MotherDuck-managed DuckLake. Commit ${GITHUB_SHA}. Includes a failpoints build for fault injection." \
             dist/etl-replicator-linux-amd64 \
             dist/etl-replicator-linux-amd64.gz \
+            dist/etl-replicator-linux-amd64-failpoints \
+            dist/etl-replicator-linux-amd64-failpoints.gz \
             dist/SHA256SUMS

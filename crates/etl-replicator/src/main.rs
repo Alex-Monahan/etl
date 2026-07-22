@@ -92,6 +92,12 @@ fn try_main() -> ReplicatorResult<()> {
     // Install rustls crypto provider before any TLS operations.
     init::init_crypto();
 
+    // Activate ETL failpoints from the `FAILPOINTS` environment variable. The
+    // returned scenario guard must stay alive for the whole process lifetime.
+    // Only compiled in when the `failpoints` feature is enabled (testing only).
+    #[cfg(feature = "failpoints")]
+    let _fail_scenario = fail::FailScenario::setup();
+
     // Load the replicator config.
     let replicator_config = init::init_config()?;
 
