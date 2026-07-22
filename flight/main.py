@@ -174,8 +174,9 @@ def save_local_cache():
 
 def compile_in_flight():
     log("=== no usable cached binary: installing rust and compiling (slow path) ===")
+    # clang + lld: the workspace .cargo/config.toml pins them as the linker.
     sh(
-        "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential pkg-config cmake 2>&1 | tail -1",
+        "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential pkg-config cmake clang lld 2>&1 | tail -1",
         timeout=900,
     )
     sh("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal", timeout=1200)
