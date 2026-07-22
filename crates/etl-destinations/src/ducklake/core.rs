@@ -1122,6 +1122,16 @@ where
         {
             info!(platform = platform_dir, "using vendored duckdb extensions");
         }
+        // A MotherDuck-managed DuckLake rejects external Parquet writes to its
+        // managed storage (only its own compute may write data files there).
+        // External compute must therefore inline data into the catalog, which
+        // MotherDuck later materializes. Force the copy pool to inline as well,
+        // instead of the default row limit of zero that writes Parquet directly.
+        let copy_data_inlining_row_limit = if is_motherduck {
+            ATTACH_DATA_INLINING_ROW_LIMIT
+        } else {
+            COPY_DATA_INLINING_ROW_LIMIT
+        };
         let setup_plan = Arc::new(build_setup_plan(
             &catalog_url,
             &data_path,
@@ -1134,7 +1144,7 @@ where
             &data_path,
             s3.as_ref(),
             metadata_schema.as_deref(),
-            COPY_DATA_INLINING_ROW_LIMIT,
+            copy_data_inlining_row_limit,
         )?);
 
         let interrupt_registry = Arc::new(DuckLakeInterruptRegistry::default());
