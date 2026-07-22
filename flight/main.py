@@ -10,8 +10,20 @@ Binary provisioning:
   2. Otherwise install rustup + toolchain and compile in the flight, then (if a
      github token secret is configured) push the fresh cache back to the fork.
 
-The flight inserts rows into Postgres periodically while the replicator runs,
-then verifies the DuckLake table matches the source table.
+Workload/test matrix exercised while the replicator runs:
+  - initial COPY of pre-seeded rows
+  - mixed insert/update/delete rounds
+  - small single-row transactions (DuckLake data-inlining path)
+  - one large multi-thousand-row transaction
+  - TOAST columns: ~100KB text bodies, title-only updates (unchanged-TOAST),
+    body rewrites, deletes
+  - NULLs, unicode text, jsonb values
+  - live schema changes: add column with default, add+drop column, rename column
+  - TRUNCATE on a dedicated table
+
+Verification compares dialect-safe integer fingerprints (counts, id sums,
+cents-scaled amount sums, text lengths) between source Postgres and DuckLake,
+plus source/lake column-list equality after DDL.
 """
 
 import os
@@ -39,9 +51,10 @@ MINIO_PASS = "minioadmin"
 MINIO_ADDR = "127.0.0.1:9100"
 BUCKET = "etl-poc"
 DATA_PATH = f"s3://{BUCKET}/lake"
-INSERT_ROUNDS = int(os.environ.get("INSERT_ROUNDS", "6"))
-INSERT_INTERVAL_SECS = int(os.environ.get("INSERT_INTERVAL_SECS", "15"))
-VERIFY_TIMEOUT_SECS = int(os.environ.get("VERIFY_TIMEOUT_SECS", "180"))
+INSERT_ROUNDS = int(os.environ.get("INSERT_ROUNDS", "3"))
+INSERT_INTERVAL_SECS = int(os.environ.get("INSERT_INTERVAL_SECS", "10"))
+LARGE_INSERT_ROWS = int(os.environ.get("LARGE_INSERT_ROWS", "50000"))
+VERIFY_TIMEOUT_SECS = int(os.environ.get("VERIFY_TIMEOUT_SECS", "300"))
 
 procs = []
 
@@ -193,12 +206,12 @@ def pg_conf_dir():
     return ver, f"/etc/postgresql/{ver}/main"
 
 
-def psql(db, sql, check=True):
+def psql(db, sql, check=True, quiet=False):
     path = f"{WORK}/cmd.sql"
     with open(path, "w") as f:
         f.write(sql)
     os.chmod(path, 0o644)
-    return sh(f'su postgres -c "psql -v ON_ERROR_STOP=1 -d {db} -f {path}"', check=check)
+    return sh(f'su postgres -c "psql -v ON_ERROR_STOP=1 -d {db} -f {path}"', check=check, quiet=quiet)
 
 
 def psql_value(db, sql):
@@ -233,7 +246,20 @@ def setup_postgres():
             status text not null default 'new',
             created_at timestamptz not null default now()
         );
-        create publication {PUBLICATION} for table public.orders;
+        -- TOAST test table: body values are large enough to be toasted.
+        create table public.documents (
+            id bigint primary key,
+            title text not null,
+            body text not null,
+            meta jsonb,
+            created_at timestamptz not null default now()
+        );
+        create table public.truncate_me (
+            id bigint primary key,
+            note text
+        );
+        create publication {PUBLICATION}
+            for table public.orders, public.documents, public.truncate_me;
     """)
     log(f"wal_level={psql_value('postgres', 'show wal_level;')}")
 
@@ -289,7 +315,7 @@ def write_replicator_config():
     cfg_dir = f"{WORK}/config"
     os.makedirs(cfg_dir, exist_ok=True)
     open(f"{cfg_dir}/base.yaml", "w").close()
-    prod = f"""
+    cfg = f"""
 destination:
   ducklake:
     catalog_url: "postgres://postgres:{PG_PASSWORD}@127.0.0.1:5432/{CATALOG_DB}"
@@ -318,7 +344,7 @@ pipeline:
     # dev environment => console logging (prod logs to rotating files under
     # ./logs, which is useless inside a flight).
     with open(f"{cfg_dir}/dev.yaml", "w") as f:
-        f.write(prod)
+        f.write(cfg)
     log(f"replicator config written to {cfg_dir}")
     return cfg_dir
 
@@ -329,6 +355,8 @@ def seed_initial_rows():
         insert into public.orders (id, customer, amount)
         select g, 'seed-customer-' || (g % 50), round((random() * 500)::numeric, 2)
         from generate_series(1, 1000) g;
+        insert into public.truncate_me
+        select g, 'pre-truncate-' || g from generate_series(1, 100) g;
     """)
 
 
@@ -341,13 +369,17 @@ def start_replicator(cfg_dir):
     })
 
 
-def periodic_inserts(rep):
-    log(f"=== periodic writes: {INSERT_ROUNDS} rounds every {INSERT_INTERVAL_SECS}s ===")
+def check_alive(rep):
+    if rep.poll() is not None:
+        raise RuntimeError(f"replicator exited early with code {rep.returncode}")
+
+
+def phase_mixed_rounds(rep):
+    log(f"=== phase: mixed insert/update/delete rounds ({INSERT_ROUNDS} x {INSERT_INTERVAL_SECS}s) ===")
     next_id = 1001
     for round_no in range(1, INSERT_ROUNDS + 1):
         time.sleep(INSERT_INTERVAL_SECS)
-        if rep.poll() is not None:
-            raise RuntimeError(f"replicator exited early with code {rep.returncode}")
+        check_alive(rep)
         lo, hi = next_id, next_id + 99
         psql(SOURCE_DB, f"""
             insert into public.orders (id, customer, amount)
@@ -356,15 +388,154 @@ def periodic_inserts(rep):
             update public.orders set status = 'updated-r{round_no}', amount = amount + 1
             where id % 97 = {round_no};
             delete from public.orders where id % 251 = {round_no};
-        """, check=True)
+        """, quiet=True)
         cnt = psql_value(SOURCE_DB, "select count(*) from public.orders;")
         log(f"round {round_no}: inserted {lo}..{hi}, source row count now {cnt}")
         next_id = hi + 1
+    return next_id
 
 
-def source_state():
-    row = psql_value(SOURCE_DB, "select count(*) || '|' || coalesce(sum(id),0) || '|' || coalesce(sum(amount),0) from public.orders;")
-    return row
+def phase_small_inserts(rep, next_id):
+    log("=== phase: small single-row transactions (data-inlining path) ===")
+    check_alive(rep)
+    for i in range(10):
+        psql(SOURCE_DB, f"""
+            insert into public.orders (id, customer, amount)
+            values ({next_id + i}, 'tiny-txn-{i}', {i}.25);
+        """, quiet=True)
+    log(f"10 single-row inserts done ({next_id}..{next_id + 9})")
+    return next_id + 10
+
+
+def phase_large_insert(rep, next_id):
+    log(f"=== phase: large single-transaction insert ({LARGE_INSERT_ROWS} rows) ===")
+    check_alive(rep)
+    lo, hi = next_id, next_id + LARGE_INSERT_ROWS - 1
+    psql(SOURCE_DB, f"""
+        insert into public.orders (id, customer, amount)
+        select g, 'bulk-customer-' || (g % 1000), round((random() * 1000)::numeric, 2)
+        from generate_series({lo}, {hi}) g;
+    """, quiet=True)
+    log(f"large insert committed: ids {lo}..{hi}")
+    return hi + 1
+
+
+def phase_toast(rep):
+    log("=== phase: TOAST columns (large text bodies) ===")
+    check_alive(rep)
+    # ~96KB bodies (well past the ~2KB TOAST threshold), unicode titles,
+    # jsonb with NULLs on odd rows.
+    psql(SOURCE_DB, """
+        insert into public.documents (id, title, body, meta)
+        select g,
+               'doc-café-日本語-' || g,
+               repeat(md5(g::text), 3000),
+               case when g % 2 = 0 then jsonb_build_object('k', g, 'tag', 'even') end
+        from generate_series(1, 20) g;
+    """, quiet=True)
+    log("20 documents inserted with ~96KB bodies")
+    time.sleep(3)
+    # Title-only update: body is NOT sent by pgoutput (unchanged-toast) with
+    # default replica identity — exercises ETL's partial-update handling.
+    psql(SOURCE_DB, """
+        update public.documents set title = title || '-retitled' where id % 2 = 1;
+    """, quiet=True)
+    log("title-only updates on odd ids (unchanged-TOAST path)")
+    # Body rewrites and a delete.
+    psql(SOURCE_DB, """
+        update public.documents set body = repeat(md5('rewrite' || id::text), 3500) where id in (2, 4);
+        delete from public.documents where id = 20;
+    """, quiet=True)
+    log("body rewrites on ids 2,4; deleted id 20")
+
+
+def phase_schema_changes(rep):
+    log("=== phase: live schema changes (DDL replication) ===")
+    check_alive(rep)
+    psql(SOURCE_DB, """
+        alter table public.orders add column discount numeric(5,2) not null default 0;
+    """)
+    time.sleep(2)
+    psql(SOURCE_DB, """
+        update public.orders set discount = 5.25 where id % 100 = 0;
+    """, quiet=True)
+    log("added orders.discount with default 0, set 5.25 on id%100=0")
+    psql(SOURCE_DB, """
+        alter table public.orders add column scratch text;
+    """)
+    time.sleep(2)
+    psql(SOURCE_DB, """
+        alter table public.orders drop column scratch;
+    """)
+    log("added and dropped orders.scratch")
+    psql(SOURCE_DB, """
+        alter table public.orders rename column status to order_status;
+    """)
+    time.sleep(2)
+    psql(SOURCE_DB, """
+        update public.orders set order_status = 'updated-after-rename' where id % 500 = 0;
+    """, quiet=True)
+    log("renamed status -> order_status and wrote through the new name")
+
+
+def phase_truncate(rep):
+    log("=== phase: TRUNCATE ===")
+    check_alive(rep)
+    psql(SOURCE_DB, "truncate table public.truncate_me;")
+    time.sleep(2)
+    psql(SOURCE_DB, """
+        insert into public.truncate_me
+        select g, 'post-truncate-' || g from generate_series(1001, 1005) g;
+    """, quiet=True)
+    log("truncated truncate_me (100 rows) and inserted 5 post-truncate rows")
+
+
+# Integer-only aggregates so Postgres and DuckDB render identical strings.
+FINGERPRINT_QUERIES = [
+    ("orders",
+     "select count(*) || '|' || coalesce(sum(id),0)"
+     " || '|' || coalesce(sum(cast(amount*100 as bigint)),0)"
+     " || '|' || coalesce(sum(cast(discount*100 as bigint)),0)"
+     " || '|' || count(*) filter (where order_status like 'updated-%')"
+     " from {t}orders"),
+    ("documents",
+     "select count(*) || '|' || coalesce(sum(id),0)"
+     " || '|' || coalesce(sum(length(title)),0)"
+     " || '|' || coalesce(sum(length(body)),0)"
+     " || '|' || count(meta)"
+     " || '|' || count(*) filter (where title like '%-retitled')"
+     " from {t}documents"),
+    ("truncate_me",
+     "select count(*) || '|' || coalesce(sum(id),0) from {t}truncate_me"),
+]
+
+
+def source_fingerprint():
+    parts = []
+    for name, q in FINGERPRINT_QUERIES:
+        parts.append(f"{name}={psql_value(SOURCE_DB, q.format(t='public.') + ';')}")
+    return "; ".join(parts)
+
+
+def lake_fingerprint(con):
+    parts = []
+    for name, q in FINGERPRINT_QUERIES:
+        val = con.execute(q.format(t="lake.public.")).fetchone()[0]
+        parts.append(f"{name}={val}")
+    return "; ".join(parts)
+
+
+def source_columns(table):
+    out = psql_value(
+        SOURCE_DB,
+        f"select string_agg(column_name, ',' order by column_name) from information_schema.columns "
+        f"where table_schema = 'public' and table_name = '{table}';")
+    return sorted(out.split(","))
+
+
+def lake_columns(con, table):
+    rows = con.execute(f"describe lake.public.{table}").fetchall()
+    return sorted(r[0] for r in rows if not r[0].startswith("__etl_"))
 
 
 def verify_ducklake():
@@ -386,34 +557,43 @@ def verify_ducklake():
         AS lake (DATA_PATH '{DATA_PATH}');
     """)
 
-    expected = source_state()
     deadline = time.time() + VERIFY_TIMEOUT_SECS
-    got = None
+    expected = got = None
     while time.time() < deadline:
+        expected = source_fingerprint()
         try:
-            got = con.execute(
-                "select count(*) || '|' || coalesce(sum(id),0) || '|' || coalesce(sum(amount),0) from lake.public.orders"
-            ).fetchone()[0]
+            got = lake_fingerprint(con)
         except Exception as e:
-            log(f"lake table not readable yet: {e}")
+            log(f"lake not fully readable yet: {str(e).splitlines()[0][:200]}")
             got = None
-        expected = source_state()
         if got == expected:
             break
-        log(f"waiting for convergence: source={expected} lake={got}")
+        log(f"waiting for convergence:\n  source={expected}\n  lake  ={got}")
         time.sleep(5)
 
     print("\n================ RESULT ================", flush=True)
-    log(f"source (count|sum(id)|sum(amount)): {expected}")
-    log(f"lake   (count|sum(id)|sum(amount)): {got}")
-    ok = got == expected
-    log("REPLICATION VERIFIED ✅" if ok else "MISMATCH ❌")
+    log(f"source fingerprint: {expected}")
+    log(f"lake   fingerprint: {got}")
+    data_ok = got == expected
+    log("DATA " + ("MATCH ✅" if data_ok else "MISMATCH ❌"))
+
+    schema_ok = True
+    for table in ("orders", "documents", "truncate_me"):
+        try:
+            src_cols, lk_cols = source_columns(table), lake_columns(con, table)
+            ok = src_cols == lk_cols
+            schema_ok &= ok
+            log(f"schema {table}: {'MATCH ✅' if ok else f'MISMATCH ❌ source={src_cols} lake={lk_cols}'}")
+        except Exception as e:
+            schema_ok = False
+            log(f"schema {table}: check failed: {e}")
 
     for label, q in [
         # created_at cast to varchar: timestamptz fetch needs pytz, not installed.
-        ("sample replicated rows",
-         "select id, customer, amount, status, cast(created_at as varchar) from lake.public.orders order by id limit 5"),
-        ("updated rows made it", "select count(*) from lake.public.orders where status like 'updated-%'"),
+        ("sample orders rows (post-rename schema)",
+         "select id, customer, amount, order_status, discount from lake.public.orders order by id limit 3"),
+        ("toast integrity: per-row body lengths",
+         "select id, length(title), length(body) from lake.public.documents order by id limit 6"),
         ("ducklake snapshots", "select count(*) from lake.snapshots()"),
     ]:
         try:
@@ -421,8 +601,8 @@ def verify_ducklake():
         except Exception as e:
             log(f"{label} failed: {e}")
     if HAVE_MC:
-        sh(f"{WORK}/mc ls --recursive local/{BUCKET} | tail -5; {WORK}/mc du local/{BUCKET}", check=False)
-    return ok
+        sh(f"{WORK}/mc du local/{BUCKET}; {WORK}/mc ls --recursive local/{BUCKET} | tail -5", check=False)
+    return data_ok and schema_ok
 
 
 def cleanup():
@@ -459,11 +639,16 @@ def main():
     seed_initial_rows()
     rep = start_replicator(cfg_dir)
     try:
-        periodic_inserts(rep)
+        next_id = phase_mixed_rounds(rep)
+        next_id = phase_small_inserts(rep, next_id)
+        next_id = phase_large_insert(rep, next_id)
+        phase_toast(rep)
+        phase_schema_changes(rep)
+        phase_truncate(rep)
         ok = verify_ducklake()
         if not ok:
             raise RuntimeError("DuckLake state did not converge to source state")
-        log("PoC finished successfully")
+        log("PoC finished successfully — all test phases verified")
     finally:
         cleanup()
 
