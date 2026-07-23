@@ -214,6 +214,7 @@ mod ducklake {
             maintenance_target_file_size,
             expire_snapshots_older_than,
             maintenance_mode,
+            motherduck_use_ducklake,
         } = &replicator_config.destination
         else {
             unreachable!("Destination kind should match DuckLake config");
@@ -280,6 +281,7 @@ mod ducklake {
             metadata_schema.clone(),
             maintenance_target_file_size.clone(),
             expire_snapshots_older_than.clone(),
+            *motherduck_use_ducklake,
             external_maintenance,
             store.clone(),
         )

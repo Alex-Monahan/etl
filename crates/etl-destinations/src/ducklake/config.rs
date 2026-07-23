@@ -616,17 +616,23 @@ pub(super) fn build_setup_sql(
         s3,
         metadata_schema,
         super::ATTACH_DATA_INLINING_ROW_LIMIT,
+        true,
     )?
     .combined_sql())
 }
 
 /// Builds the ordered setup phases executed for each new pool connection.
+///
+/// `use_ducklake` only affects MotherDuck (`md:`) catalogs: `false` targets a
+/// native MotherDuck database, `true` a managed DuckLake. Self-hosted
+/// (`postgres`/`file`) catalogs are always DuckLake.
 pub(super) fn build_setup_plan(
     catalog_url: &Url,
     data_path: &Url,
     s3: Option<&S3Config>,
     metadata_schema: Option<&str>,
     data_inlining_row_limit: u64,
+    use_ducklake: bool,
 ) -> EtlResult<DuckLakeSetupPlan> {
     let strategy = current_duckdb_extension_strategy()?;
     let vendored_root = match strategy {
@@ -648,6 +654,7 @@ pub(super) fn build_setup_plan(
         strategy,
         vendored_root.as_deref(),
         data_inlining_row_limit,
+        use_ducklake,
     )
 }
 
@@ -668,6 +675,7 @@ fn build_setup_sql_with_strategy(
         strategy,
         vendored_root,
         super::ATTACH_DATA_INLINING_ROW_LIMIT,
+        true,
     )?
     .combined_sql())
 }
@@ -676,19 +684,59 @@ fn build_setup_sql_with_strategy(
 /// the default home-relative extension directory may not be writable.
 const MOTHERDUCK_EXTENSION_DIRECTORY: &str = "/tmp/duckdb_extensions";
 
-/// Builds the setup plan for a MotherDuck-managed DuckLake catalog.
+/// Extracts the MotherDuck database name from a `md:` catalog URL.
 ///
-/// MotherDuck manages both the catalog metadata and the underlying storage, so
-/// the plan installs the `ducklake` and `motherduck` extensions, attaches the
-/// `ducklake:md:__ducklake_metadata_<db>` catalog without a `DATA_PATH`, and
-/// authenticates using the `motherduck_token` environment variable that the
-/// `motherduck` extension reads on load.
+/// Accepts `md:<db>` (native database or DuckLake) and the legacy
+/// `md:__ducklake_metadata_<db>` form, returning `<db>` in both cases.
+pub(super) fn motherduck_database_name(catalog_url: &Url) -> String {
+    let raw = catalog_url
+        .as_str()
+        .trim_start_matches("motherduck:")
+        .trim_start_matches("md:");
+    raw.strip_prefix("__ducklake_metadata_").unwrap_or(raw).to_owned()
+}
+
+/// Builds the setup plan for a MotherDuck destination.
+///
+/// With `use_ducklake = false` (the default) the plan targets a native
+/// MotherDuck database (`ATTACH 'md:<db>'`), installing only the `motherduck`
+/// extension and skipping all DuckLake-specific options. With
+/// `use_ducklake = true` it targets a MotherDuck-managed DuckLake
+/// (`ATTACH 'ducklake:md:__ducklake_metadata_<db>'` with data inlining and
+/// Parquet settings). Both authenticate via the `motherduck_token` environment
+/// variable read by the `motherduck` extension on load.
 fn build_motherduck_setup_plan(
     catalog_url: &Url,
     data_inlining_row_limit: u64,
+    use_ducklake: bool,
 ) -> EtlResult<DuckLakeSetupPlan> {
     let lake_catalog = quote_identifier(LAKE_CATALOG);
-    let steps = vec![
+    let db = motherduck_database_name(catalog_url);
+
+    let load_extensions = if use_ducklake {
+        format!(
+            "SET extension_directory = {}; INSTALL ducklake; LOAD ducklake; INSTALL motherduck; \
+             LOAD motherduck;",
+            quote_literal(MOTHERDUCK_EXTENSION_DIRECTORY)
+        )
+    } else {
+        format!(
+            "SET extension_directory = {}; INSTALL motherduck; LOAD motherduck;",
+            quote_literal(MOTHERDUCK_EXTENSION_DIRECTORY)
+        )
+    };
+
+    let attach = if use_ducklake {
+        format!(
+            "ATTACH {} AS {lake_catalog} (DATA_INLINING_ROW_LIMIT {}, AUTOMATIC_MIGRATION true);",
+            quote_literal(&format!("ducklake:md:__ducklake_metadata_{db}")),
+            data_inlining_row_limit
+        )
+    } else {
+        format!("ATTACH {} AS {lake_catalog};", quote_literal(&format!("md:{db}")))
+    };
+
+    let mut steps = vec![
         DuckLakeSetupStep {
             label: "configure_writer_session",
             sql: configure_writer_session_sql(),
@@ -697,32 +745,21 @@ fn build_motherduck_setup_plan(
             label: "configure_resource_limits",
             sql: configure_resource_limits_sql(),
         },
-        DuckLakeSetupStep {
-            label: "load_extensions",
-            sql: format!(
-                "SET extension_directory = {}; INSTALL ducklake; LOAD ducklake; INSTALL \
-                 motherduck; LOAD motherduck;",
-                quote_literal(MOTHERDUCK_EXTENSION_DIRECTORY)
-            ),
-        },
-        DuckLakeSetupStep {
-            label: "attach_catalog",
-            sql: format!(
-                "ATTACH {} AS {lake_catalog} (DATA_INLINING_ROW_LIMIT {}, AUTOMATIC_MIGRATION \
-                 true);",
-                quote_literal(&format!("ducklake:{}", catalog_url.as_str())),
-                data_inlining_row_limit
-            ),
-        },
-        DuckLakeSetupStep {
+        DuckLakeSetupStep { label: "load_extensions", sql: load_extensions },
+        DuckLakeSetupStep { label: "attach_catalog", sql: attach },
+    ];
+    // Parquet writer settings are DuckLake-only.
+    if use_ducklake {
+        steps.push(DuckLakeSetupStep {
             label: "configure_parquet",
             sql: configure_parquet_settings_sql(),
-        },
-    ];
+        });
+    }
 
     Ok(DuckLakeSetupPlan { steps })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_setup_plan_with_strategy(
     catalog_url: &Url,
     data_path: &Url,
@@ -731,12 +768,14 @@ fn build_setup_plan_with_strategy(
     strategy: DuckDbExtensionStrategy,
     vendored_root: Option<&Path>,
     data_inlining_row_limit: u64,
+    use_ducklake: bool,
 ) -> EtlResult<DuckLakeSetupPlan> {
-    // A MotherDuck-managed DuckLake owns its storage, so it needs neither a
-    // data path nor S3 credentials, and it is reached through the `motherduck`
-    // extension rather than `postgres_scanner`/`httpfs`.
+    // MotherDuck catalogs own their storage, so they need neither a data path
+    // nor S3 credentials, and are reached through the `motherduck` extension
+    // rather than `postgres_scanner`/`httpfs`. `use_ducklake` selects a native
+    // MotherDuck database vs a managed DuckLake.
     if matches!(catalog_url.scheme(), "md" | "motherduck") {
-        return build_motherduck_setup_plan(catalog_url, data_inlining_row_limit);
+        return build_motherduck_setup_plan(catalog_url, data_inlining_row_limit, use_ducklake);
     }
 
     let catalog_target = catalog_attach_target(catalog_url)?;
@@ -1354,6 +1393,7 @@ mod tests {
             DuckDbExtensionStrategy::VendoredLocal { platform_dir: "linux_arm64" },
             Some(&extension_dir),
             crate::ducklake::COPY_DATA_INLINING_ROW_LIMIT,
+            true,
         )
         .unwrap();
 

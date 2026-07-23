@@ -388,6 +388,7 @@ pub(super) async fn ensure_applied_batches_table_exists(
     blocking_slots: Arc<Semaphore>,
     table_creation_slots: Arc<Semaphore>,
     applied_batches_table_created: Arc<AtomicBool>,
+    is_ducklake: bool,
 ) -> EtlResult<()> {
     if applied_batches_table_created.load(Ordering::Relaxed) {
         return Ok(());
@@ -430,19 +431,23 @@ pub(super) async fn ensure_applied_batches_table_exists(
         }
         ensure_helper_table_replay_epoch_column(conn, APPLIED_BATCHES_TABLE)?;
 
-        let set_option_sql = format!(
-            "CALL {LAKE_CATALOG}.set_option('data_inlining_row_limit', {}, table_name => {});",
-            HELPER_TABLE_DATA_INLINING_ROW_LIMIT,
-            quote_literal(APPLIED_BATCHES_TABLE),
-        );
-        conn.execute_batch(&set_option_sql).map_err(|err| {
-            etl_error!(
-                ErrorKind::DestinationQueryFailed,
-                "DuckLake set_option failed",
-                format_query_error_detail(&set_option_sql),
-                source: err
-            )
-        })?;
+        // data_inlining_row_limit is a DuckLake-only per-table option; a native
+        // MotherDuck database has no such option.
+        if is_ducklake {
+            let set_option_sql = format!(
+                "CALL {LAKE_CATALOG}.set_option('data_inlining_row_limit', {}, table_name => {});",
+                HELPER_TABLE_DATA_INLINING_ROW_LIMIT,
+                quote_literal(APPLIED_BATCHES_TABLE),
+            );
+            conn.execute_batch(&set_option_sql).map_err(|err| {
+                etl_error!(
+                    ErrorKind::DestinationQueryFailed,
+                    "DuckLake set_option failed",
+                    format_query_error_detail(&set_option_sql),
+                    source: err
+                )
+            })?;
+        }
 
         created.store(true, Ordering::Relaxed);
         Ok(())
@@ -456,6 +461,7 @@ pub(super) async fn ensure_streaming_progress_table_exists(
     blocking_slots: Arc<Semaphore>,
     table_creation_slots: Arc<Semaphore>,
     streaming_progress_table_created: Arc<AtomicBool>,
+    is_ducklake: bool,
 ) -> EtlResult<()> {
     if streaming_progress_table_created.load(Ordering::Relaxed) {
         return Ok(());
@@ -496,19 +502,22 @@ pub(super) async fn ensure_streaming_progress_table_exists(
         }
         ensure_helper_table_replay_epoch_column(conn, STREAMING_PROGRESS_TABLE)?;
 
-        let set_option_sql = format!(
-            "CALL {LAKE_CATALOG}.set_option('data_inlining_row_limit', {}, table_name => {});",
-            HELPER_TABLE_DATA_INLINING_ROW_LIMIT,
-            quote_literal(STREAMING_PROGRESS_TABLE),
-        );
-        conn.execute_batch(&set_option_sql).map_err(|error| {
-            etl_error!(
-                ErrorKind::DestinationQueryFailed,
-                "DuckLake set_option failed",
-                format_query_error_detail(&set_option_sql),
-                source: error
-            )
-        })?;
+        // data_inlining_row_limit is a DuckLake-only per-table option.
+        if is_ducklake {
+            let set_option_sql = format!(
+                "CALL {LAKE_CATALOG}.set_option('data_inlining_row_limit', {}, table_name => {});",
+                HELPER_TABLE_DATA_INLINING_ROW_LIMIT,
+                quote_literal(STREAMING_PROGRESS_TABLE),
+            );
+            conn.execute_batch(&set_option_sql).map_err(|error| {
+                etl_error!(
+                    ErrorKind::DestinationQueryFailed,
+                    "DuckLake set_option failed",
+                    format_query_error_detail(&set_option_sql),
+                    source: error
+                )
+            })?;
+        }
 
         created.store(true, Ordering::Relaxed);
         Ok(())

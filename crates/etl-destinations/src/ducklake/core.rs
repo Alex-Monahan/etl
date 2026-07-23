@@ -170,6 +170,9 @@ pub struct DuckLakeDestination<S> {
     metrics_sampler: Arc<Option<DuckLakeMetricsSampler>>,
     metadata_schema: Arc<str>,
     expire_snapshots_older_than: Arc<str>,
+    /// Whether the destination is a DuckLake (vs a native MotherDuck database).
+    /// Native mode skips DuckLake-only helper-table options.
+    is_ducklake: bool,
     metadata_pg_pool: PgPool,
     table_creation_slots: Arc<Semaphore>,
     table_write_slots: Arc<Mutex<HashMap<DuckLakeTableName, Arc<Semaphore>>>>,
@@ -1045,6 +1048,9 @@ where
             metadata_schema,
             maintenance_target_file_size,
             expire_snapshots_older_than,
+            // `new` targets self-hosted / managed DuckLake; native MotherDuck is
+            // reached only through `new_with_external_maintenance`.
+            true,
             DuckLakeExternalMaintenanceConfig::default(),
             store,
         )
@@ -1063,15 +1069,22 @@ where
         metadata_schema: Option<String>,
         maintenance_target_file_size: Option<String>,
         expire_snapshots_older_than: Option<String>,
+        motherduck_use_ducklake: bool,
         external_maintenance: DuckLakeExternalMaintenanceConfig,
         store: S,
     ) -> EtlResult<Self> {
         register_metrics();
 
-        // A MotherDuck-managed catalog (`md:__ducklake_metadata_<db>`) has no
-        // PostgreSQL endpoint of its own, so the replay-epoch metadata pool is
-        // backed by a separately provided PostgreSQL URL instead.
+        // A MotherDuck catalog (`md:<db>`) has no PostgreSQL endpoint of its own,
+        // so the replay-epoch metadata pool is backed by a separately provided
+        // PostgreSQL URL instead.
         let is_motherduck = matches!(catalog_url.scheme(), "md" | "motherduck");
+
+        // Whether the destination is a DuckLake (managed snapshots/Parquet) vs a
+        // native MotherDuck database. Self-hosted (postgres/file) catalogs are
+        // always DuckLake; MotherDuck can be either. Native mode skips all
+        // DuckLake-specific setup (parquet/inlining/target_file_size/set_option).
+        let is_ducklake = !is_motherduck || motherduck_use_ducklake;
 
         if !matches!(catalog_url.scheme(), "postgres" | "postgresql" | "md" | "motherduck") {
             return Err(etl_error!(
@@ -1138,6 +1151,7 @@ where
             s3.as_ref(),
             metadata_schema.as_deref(),
             ATTACH_DATA_INLINING_ROW_LIMIT,
+            is_ducklake,
         )?);
         let copy_setup_plan = Arc::new(build_setup_plan(
             &catalog_url,
@@ -1145,6 +1159,7 @@ where
             s3.as_ref(),
             metadata_schema.as_deref(),
             copy_data_inlining_row_limit,
+            is_ducklake,
         )?);
 
         let interrupt_registry = Arc::new(DuckLakeInterruptRegistry::default());
@@ -1172,6 +1187,10 @@ where
             Arc::new(build_warm_ducklake_pool(manager.as_ref().clone(), pool_size, "write").await?);
         let blocking_slots = Arc::new(Semaphore::new(pool_size as usize));
 
+        // `target_file_size` and `expire_snapshots_older_than` are DuckLake-only
+        // catalog options; a native MotherDuck database has neither, so skip this
+        // whole setup block for native mode.
+        if is_ducklake {
         // `target_file_size` is a catalog-wide DuckLake option consumed during
         // compaction. Apply it once on the write pool so foreground writes and
         // external maintenance jobs use the same configured catalog option.
@@ -1226,6 +1245,7 @@ where
             },
         )
         .await?;
+        } // end if is_ducklake (DuckLake-only catalog options)
         let metadata_schema = match metadata_schema {
             Some(metadata_schema) => metadata_schema,
             // The MotherDuck-managed catalog keeps its DuckLake metadata
@@ -1258,6 +1278,7 @@ where
             Arc::clone(&blocking_slots),
             Arc::clone(&table_creation_slots),
             Arc::clone(&applied_batches_table_created),
+            is_ducklake,
         )
         .await?;
         ensure_streaming_progress_table_exists(
@@ -1265,6 +1286,7 @@ where
             Arc::clone(&blocking_slots),
             Arc::clone(&table_creation_slots),
             Arc::clone(&streaming_progress_table_created),
+            is_ducklake,
         )
         .await?;
 
@@ -1283,6 +1305,7 @@ where
             metrics_sampler: Arc::new(None),
             metadata_schema: Arc::clone(&metadata_schema),
             expire_snapshots_older_than: Arc::clone(&expire_snapshots_older_than),
+            is_ducklake,
             metadata_pg_pool: metadata_pg_pool.clone(),
             table_creation_slots,
             table_write_slots: Arc::default(),
@@ -2486,6 +2509,7 @@ where
             Arc::clone(&self.blocking_slots),
             Arc::clone(&self.table_creation_slots),
             Arc::clone(&self.applied_batches_table_created),
+            self.is_ducklake,
         )
         .await
     }
@@ -2498,6 +2522,7 @@ where
             Arc::clone(&self.blocking_slots),
             Arc::clone(&self.table_creation_slots),
             Arc::clone(&self.streaming_progress_table_created),
+            self.is_ducklake,
         )
         .await
     }

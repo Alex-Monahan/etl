@@ -198,6 +198,11 @@ pub enum DestinationConfig {
         /// External maintenance coordination backend.
         #[serde(default)]
         maintenance_mode: DuckLakeMaintenanceMode,
+        /// For MotherDuck (`md:`) catalogs, target a managed DuckLake instead of
+        /// a native MotherDuck database. Ignored for `postgres`/`file` catalogs
+        /// (always DuckLake). Defaults to `false` (native MotherDuck database).
+        #[serde(default)]
+        motherduck_use_ducklake: bool,
     },
     Snowflake {
         /// Snowflake account identifier in "ORGNAME-ACCOUNTNAME" format.
@@ -419,6 +424,11 @@ pub enum DestinationConfigWithoutSecrets {
         /// External maintenance coordination backend.
         #[serde(default)]
         maintenance_mode: DuckLakeMaintenanceMode,
+        /// For MotherDuck (`md:`) catalogs, target a managed DuckLake instead of
+        /// a native MotherDuck database. Ignored for `postgres`/`file` catalogs
+        /// (always DuckLake). Defaults to `false` (native MotherDuck database).
+        #[serde(default)]
+        motherduck_use_ducklake: bool,
     },
     Snowflake {
         /// Snowflake account identifier in "ORGNAME-ACCOUNTNAME" format.
@@ -471,6 +481,7 @@ impl From<DestinationConfig> for DestinationConfigWithoutSecrets {
                 maintenance_target_file_size,
                 expire_snapshots_older_than,
                 maintenance_mode,
+                motherduck_use_ducklake,
             } => DestinationConfigWithoutSecrets::Ducklake {
                 data_path,
                 pool_size,
@@ -482,6 +493,7 @@ impl From<DestinationConfig> for DestinationConfigWithoutSecrets {
                 maintenance_target_file_size,
                 expire_snapshots_older_than,
                 maintenance_mode,
+                motherduck_use_ducklake,
             },
             DestinationConfig::Snowflake {
                 account_id,
@@ -523,6 +535,7 @@ mod tests {
             maintenance_target_file_size: None,
             expire_snapshots_older_than: None,
             maintenance_mode: DuckLakeMaintenanceMode::Kubernetes,
+            motherduck_use_ducklake: false,
         };
 
         let without_secrets = DestinationConfigWithoutSecrets::from(config);
