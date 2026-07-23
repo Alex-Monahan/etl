@@ -487,6 +487,51 @@ impl PgReplicationClient {
         );
     }
 
+    /// Returns the numeric server version (e.g. `170004` for 17.4, `180004` for
+    /// 18.4).
+    pub async fn server_version_num(&self) -> EtlResult<i32> {
+        for result in self.client.simple_query("show server_version_num;").await? {
+            if let SimpleQueryMessage::Row(row) = result {
+                let raw = row.try_get("server_version_num")?.unwrap_or("0");
+                return raw.parse::<i32>().map_err(|_| {
+                    etl_error!(
+                        ErrorKind::ConversionError,
+                        "Invalid server_version_num",
+                        format!("Could not parse server_version_num '{raw}'")
+                    )
+                });
+            }
+        }
+
+        bail!(
+            ErrorKind::SourceConnectionFailed,
+            "Server version not found",
+            "The command show server_version_num returned no rows".to_owned()
+        )
+    }
+
+    /// Marks a logical replication slot as a failover slot (PostgreSQL 17+).
+    ///
+    /// Failover slots are synchronized to standbys (when the cluster enables
+    /// `sync_replication_slots` and lists the standby in
+    /// `synchronized_standby_slots`) so logical replication can resume from the
+    /// synced slot after a promotion instead of losing it. Returns `false`
+    /// without altering the slot on PostgreSQL versions below 17, which do not
+    /// support the option.
+    pub async fn set_slot_failover(&self, slot_name: &str) -> EtlResult<bool> {
+        if self.server_version_num().await? < 170000 {
+            return Ok(false);
+        }
+
+        // `ALTER_REPLICATION_SLOT` is a replication-protocol command, so keep the
+        // command and option in uppercase like `CREATE_REPLICATION_SLOT`.
+        let query =
+            format!("ALTER_REPLICATION_SLOT {} (FAILOVER)", quote_identifier(slot_name));
+        self.client.simple_query(&query).await?;
+
+        Ok(true)
+    }
+
     /// Gets the slot by `slot_name`.
     ///
     /// Returns an error in case of failure or missing slot.

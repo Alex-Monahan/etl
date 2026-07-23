@@ -124,9 +124,8 @@ pub enum InvalidatedSlotBehavior {
     /// Prevents pipeline startup when the slot is invalidated.
     ///
     /// The pipeline will fail with an error indicating that the slot needs to
-    /// be manually addressed before replication can continue. This is the
-    /// safest option as it requires explicit operator intervention.
-    #[default]
+    /// be manually addressed before replication can continue. Use this when a
+    /// full automatic re-backfill on invalidation is not acceptable.
     Error,
     /// Automatically recreates the slot and restarts replication from scratch.
     ///
@@ -137,8 +136,10 @@ pub enum InvalidatedSlotBehavior {
     /// 4. Run table sync for all tables, respecting [`TableSyncCopyConfig`]
     ///    rules
     ///
-    /// This option allows the pipeline to restart replication and automatically
-    /// recover.
+    /// This is the default so a slot invalidated by WAL retention recovers
+    /// automatically (at the cost of a full re-backfill) instead of stopping
+    /// the pipeline. Pair it with failover slots to make invalidation rare.
+    #[default]
     Recreate,
 }
 

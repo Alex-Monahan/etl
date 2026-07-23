@@ -43,6 +43,42 @@ fn configure_writer_session_sql() -> String {
     format!("SET {PRESERVE_INSERTION_ORDER_OPTION_NAME} = false;")
 }
 
+/// Environment variable overriding the DuckDB spill directory.
+const DUCKDB_TEMP_DIRECTORY_ENV_VAR: &str = "ETL_DUCKDB_TEMP_DIRECTORY";
+/// Environment variable overriding the DuckDB memory limit (e.g. `12GB`).
+const DUCKDB_MEMORY_LIMIT_ENV_VAR: &str = "ETL_DUCKDB_MEMORY_LIMIT";
+/// Environment variable capping the DuckDB spill directory size (e.g. `100GB`).
+const DUCKDB_MAX_TEMP_DIRECTORY_SIZE_ENV_VAR: &str = "ETL_DUCKDB_MAX_TEMP_DIRECTORY_SIZE";
+
+/// Builds the SQL that lets the in-memory DuckDB engine spill to disk.
+///
+/// The destination runs an in-memory DuckDB connection, which does not spill
+/// unless `temp_directory` is set. Without a spill directory a single large
+/// operation (a large batch, a whole-table update, or DuckLake compaction) can
+/// exhaust memory instead of spilling. The directory defaults to a subdirectory
+/// of the system temp dir and can be overridden with `ETL_DUCKDB_TEMP_DIRECTORY`.
+/// `ETL_DUCKDB_MEMORY_LIMIT` and `ETL_DUCKDB_MAX_TEMP_DIRECTORY_SIZE` are applied
+/// only when set, so DuckDB's own defaults otherwise apply.
+fn configure_resource_limits_sql() -> String {
+    let temp_directory = env::var(DUCKDB_TEMP_DIRECTORY_ENV_VAR)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| env::temp_dir().join("etl_duckdb_spill"));
+    let temp_directory = temp_directory.to_string_lossy().into_owned();
+
+    let mut sql = format!("SET temp_directory = {};", quote_literal(&temp_directory));
+    if let Ok(memory_limit) = env::var(DUCKDB_MEMORY_LIMIT_ENV_VAR)
+        && !memory_limit.is_empty()
+    {
+        sql.push_str(&format!(" SET memory_limit = {};", quote_literal(&memory_limit)));
+    }
+    if let Ok(max_temp) = env::var(DUCKDB_MAX_TEMP_DIRECTORY_SIZE_ENV_VAR)
+        && !max_temp.is_empty()
+    {
+        sql.push_str(&format!(" SET max_temp_directory_size = {};", quote_literal(&max_temp)));
+    }
+    sql
+}
+
 /// Builds the SQL that configures DuckLake's global Parquet writer settings.
 fn configure_parquet_settings_sql() -> String {
     format!(
@@ -658,6 +694,10 @@ fn build_motherduck_setup_plan(
             sql: configure_writer_session_sql(),
         },
         DuckLakeSetupStep {
+            label: "configure_resource_limits",
+            sql: configure_resource_limits_sql(),
+        },
+        DuckLakeSetupStep {
             label: "load_extensions",
             sql: format!(
                 "SET extension_directory = {}; INSTALL ducklake; LOAD ducklake; INSTALL \
@@ -705,10 +745,16 @@ fn build_setup_plan_with_strategy(
     let needs_postgres = matches!(catalog_url.scheme(), "postgres" | "postgresql");
     let needs_httpfs = matches!(data_path.split(':').next(), Some("s3" | "gs"));
     let lake_catalog = quote_identifier(LAKE_CATALOG);
-    let mut steps = vec![DuckLakeSetupStep {
-        label: "configure_writer_session",
-        sql: configure_writer_session_sql(),
-    }];
+    let mut steps = vec![
+        DuckLakeSetupStep {
+            label: "configure_writer_session",
+            sql: configure_writer_session_sql(),
+        },
+        DuckLakeSetupStep {
+            label: "configure_resource_limits",
+            sql: configure_resource_limits_sql(),
+        },
+    ];
     let mut secret_options = BTreeMap::from([
         ("KEY_ID", quote_literal(s3.map(|s| s.access_key_id.as_str()).unwrap_or_default())),
         ("REGION", quote_literal(s3.map(|s| s.region.as_str()).unwrap_or_default())),
@@ -1311,25 +1357,27 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(plan.steps().len(), 5);
+        assert_eq!(plan.steps().len(), 6);
         assert_eq!(plan.steps()[0].label, "configure_writer_session");
-        assert_eq!(plan.steps()[1].label, "load_extensions");
-        assert_eq!(plan.steps()[2].label, "configure_object_store");
-        assert_eq!(plan.steps()[3].label, "attach_catalog");
-        assert_eq!(plan.steps()[4].label, "configure_parquet");
-        assert!(plan.steps()[3].sql.contains("DATA_INLINING_ROW_LIMIT 0"));
+        assert_eq!(plan.steps()[1].label, "configure_resource_limits");
+        assert_eq!(plan.steps()[2].label, "load_extensions");
+        assert_eq!(plan.steps()[3].label, "configure_object_store");
+        assert_eq!(plan.steps()[4].label, "attach_catalog");
+        assert_eq!(plan.steps()[5].label, "configure_parquet");
+        assert!(plan.steps()[4].sql.contains("DATA_INLINING_ROW_LIMIT 0"));
         assert_eq!(plan.steps()[0].sql, configure_writer_session_sql());
-        assert!(plan.steps()[1].sql.contains(HTTPFS_EXTENSION_FILE));
-        assert!(!plan.steps()[1].sql.contains("json"));
-        assert!(plan.steps()[2].sql.contains("CREATE OR REPLACE SECRET"));
-        assert!(plan.steps()[2].sql.contains("PROVIDER config"));
+        assert!(plan.steps()[1].sql.contains("temp_directory"));
+        assert!(plan.steps()[2].sql.contains(HTTPFS_EXTENSION_FILE));
+        assert!(!plan.steps()[2].sql.contains("json"));
+        assert!(plan.steps()[3].sql.contains("CREATE OR REPLACE SECRET"));
+        assert!(plan.steps()[3].sql.contains("PROVIDER config"));
         assert!(
-            plan.steps()[2].sql.contains(&format!("SCOPE {}", quote_literal(data_url.as_str())))
+            plan.steps()[3].sql.contains(&format!("SCOPE {}", quote_literal(data_url.as_str())))
         );
-        assert!(plan.steps()[2].sql.contains("URL_COMPATIBILITY_MODE true"));
-        assert!(plan.steps()[3].sql.contains("ATTACH"));
-        assert!(plan.steps()[3].sql.contains("METADATA_SCHEMA 'ducklake'"));
-        assert_eq!(plan.steps()[4].sql, configure_parquet_settings_sql());
+        assert!(plan.steps()[3].sql.contains("URL_COMPATIBILITY_MODE true"));
+        assert!(plan.steps()[4].sql.contains("ATTACH"));
+        assert!(plan.steps()[4].sql.contains("METADATA_SCHEMA 'ducklake'"));
+        assert_eq!(plan.steps()[5].sql, configure_parquet_settings_sql());
     }
 
     #[test]

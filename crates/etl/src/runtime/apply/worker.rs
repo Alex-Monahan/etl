@@ -5,7 +5,7 @@ use etl_postgres::slots::EtlReplicationSlot;
 use metrics::counter;
 use tokio::{sync::Semaphore, task::JoinHandle};
 use tokio_postgres::types::PgLsn;
-use tracing::{Instrument, error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 
 use crate::{
     bail,
@@ -365,6 +365,43 @@ where
 /// Init state. If any table is not in Init state when creating a new slot, it
 /// indicates that data was synchronized based on a different apply worker
 /// lineage, which would break replication correctness.
+/// Environment variable controlling PostgreSQL 17+ failover slots for the apply
+/// slot. Enabled by default; set to a falsey value to opt out.
+const FAILOVER_SLOT_ENV_VAR: &str = "ETL_FAILOVER_SLOT";
+
+/// Returns whether failover slots are enabled.
+///
+/// Defaults to `true` so slot loss on a source promotion is handled out of the
+/// box; set `ETL_FAILOVER_SLOT` to `0`/`false`/`no`/`off` to opt out.
+fn failover_slots_enabled() -> bool {
+    !matches!(
+        std::env::var(FAILOVER_SLOT_ENV_VAR).ok().as_deref(),
+        Some("0" | "false" | "FALSE" | "no" | "off")
+    )
+}
+
+/// Marks the apply slot as a failover slot when enabled and supported by the
+/// source (PostgreSQL 17+).
+///
+/// Best-effort: logs and continues on any failure so slot configuration never
+/// blocks replication startup.
+async fn ensure_failover_slot(replication_client: &PgReplicationClient, slot_name: &str) {
+    if !failover_slots_enabled() {
+        return;
+    }
+
+    match replication_client.set_slot_failover(slot_name).await {
+        Ok(true) => info!(slot_name, "configured apply worker slot as a failover slot"),
+        Ok(false) => debug!(
+            slot_name,
+            "failover slots enabled but source PostgreSQL is < 17; skipping"
+        ),
+        Err(err) => {
+            warn!(slot_name, error = %err, "failed to configure apply worker failover slot")
+        }
+    }
+}
+
 async fn get_start_lsn<S: StateStore + TableStateLifecycleStore>(
     pipeline_id: PipelineId,
     replication_client: &PgReplicationClient,
@@ -413,6 +450,11 @@ async fn get_start_lsn<S: StateStore + TableStateLifecycleStore>(
             .await;
         }
     }
+
+    // Optionally mark the apply slot as a failover slot so it survives a source
+    // promotion (PostgreSQL 17+, when the cluster syncs slots to standbys).
+    // Idempotent, so it is safe on both newly created and existing valid slots.
+    ensure_failover_slot(replication_client, &slot_name).await;
 
     // When creating a new apply worker slot, all tables must be in the `Init`
     // state. If any table is not in Init state, it means the table was
@@ -533,6 +575,8 @@ async fn handle_invalidated_slot<S: TableStateLifecycleStore>(
                 consistent_point = %create_result.consistent_point,
                 "created new apply worker replication slot after invalidation recovery"
             );
+
+            ensure_failover_slot(replication_client, slot_name).await;
 
             Ok(create_result.consistent_point)
         }
