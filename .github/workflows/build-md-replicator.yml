@@ -21,12 +21,12 @@ jobs:
     # glibc 2.39, which is too new and fails with "GLIBC_2.38 not found".
     runs-on: ubuntu-22.04
     env:
-      # Route both rustc and the cc-rs DuckDB C++ compiles through sccache. The
-      # bundled DuckDB is ~1,800 C++ translation units and dominates cold builds.
-      # sccache keys C/C++ objects on the compiler + source (not on RUSTFLAGS /
-      # CARGO_PROFILE_*), so toggling LTO / panic / codegen-units no longer busts
-      # the expensive libduckdb-sys cache — the main cause of full rebuilds here.
-      RUSTC_WRAPPER: sccache
+      # sccache caches both rustc crates and the cc-rs bundled-DuckDB C++ compiles
+      # (~1,800 translation units that dominate cold builds). It keys C/C++ objects
+      # on compiler + source (not on RUSTFLAGS / CARGO_PROFILE_*), so toggling LTO /
+      # panic / codegen-units no longer busts the expensive libduckdb-sys cache.
+      # RUSTC_WRAPPER is set later, only if the cache backend is reachable, so a
+      # GitHub Actions cache outage degrades to an uncached build instead of failing.
       SCCACHE_GHA_ENABLED: "true"
       CARGO_INCREMENTAL: "0" # required for sccache to cache rustc output
     steps:
@@ -53,6 +53,18 @@ jobs:
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.7
+
+      - name: Enable sccache if cache backend is reachable
+        # Best-effort: only route rustc/cc through sccache if the server can start
+        # (i.e. the GHA cache backend answers). Otherwise build uncached so a
+        # transient cache-service outage does not fail the whole pipeline.
+        run: |
+          if sccache --start-server; then
+            echo "sccache backend reachable; enabling RUSTC_WRAPPER"
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          else
+            echo "::warning::sccache cache backend unreachable; building without sccache"
+          fi
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -86,7 +98,7 @@ jobs:
           cp target/release/etl-replicator etl-replicator-linux-amd64-failpoints
 
       - name: sccache stats
-        run: sccache --show-stats
+        run: sccache --show-stats || true
 
       - name: Package binaries
         run: |
