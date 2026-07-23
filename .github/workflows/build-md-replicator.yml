@@ -20,6 +20,15 @@ jobs:
     # the Flights Debian base image (bookworm, glibc 2.36). ubuntu-latest ships
     # glibc 2.39, which is too new and fails with "GLIBC_2.38 not found".
     runs-on: ubuntu-22.04
+    env:
+      # Route both rustc and the cc-rs DuckDB C++ compiles through sccache. The
+      # bundled DuckDB is ~1,800 C++ translation units and dominates cold builds.
+      # sccache keys C/C++ objects on the compiler + source (not on RUSTFLAGS /
+      # CARGO_PROFILE_*), so toggling LTO / panic / codegen-units no longer busts
+      # the expensive libduckdb-sys cache — the main cause of full rebuilds here.
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      CARGO_INCREMENTAL: "0" # required for sccache to cache rustc output
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,10 +36,11 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
+          # protobuf-compiler is intentionally omitted: the ducklake-only feature
+          # set does not build bigquery/tonic/prost. Re-add it if bigquery is enabled.
           sudo apt-get install -y \
             pkg-config \
             libssl-dev \
-            protobuf-compiler \
             clang \
             lld \
             make \
@@ -41,8 +51,15 @@ jobs:
         # Honors rust-toolchain.toml (channel 1.95.0).
         run: rustup show
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          # Save the heavy cargo cache only on branch pushes so ad-hoc dispatch
+          # runs don't thrash the 10 GB GitHub Actions cache cap alongside sccache.
+          save-if: ${{ github.ref == 'refs/heads/motherduck-managed-ducklake' }}
 
       - name: Build etl-replicator (ducklake only)
         env:
@@ -67,6 +84,9 @@ jobs:
             --no-default-features --features ducklake,failpoints
           strip target/release/etl-replicator
           cp target/release/etl-replicator etl-replicator-linux-amd64-failpoints
+
+      - name: sccache stats
+        run: sccache --show-stats
 
       - name: Package binaries
         run: |
