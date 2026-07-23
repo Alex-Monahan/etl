@@ -70,13 +70,34 @@ const SQL_INSERT_BATCH_SIZE: usize = 128;
 /// Keep this small so each delete statement remains cheap while still avoiding
 /// one round-trip per deleted row.
 const SQL_DELETE_BATCH_SIZE: usize = 16;
-/// Maximum number of ordered CDC mutations grouped into one atomic DuckLake
-/// transaction.
+/// Default maximum number of ordered CDC mutations grouped into one atomic
+/// DuckLake transaction.
 ///
 /// Keeping mixed insert/delete/update streams in the same batch improves
 /// insert throughput on interleaved workloads while still capping transaction
-/// lifetime for DuckLake conflict handling.
+/// lifetime for DuckLake conflict handling. Larger values pack more source
+/// transactions into each DuckLake commit/snapshot, raising throughput for
+/// chatty single-row-transaction streams at the cost of longer transactions
+/// and coarser conflict-retry granularity.
 const CDC_MUTATION_BATCH_SIZE: usize = 16;
+
+/// Environment variable overriding [`CDC_MUTATION_BATCH_SIZE`] at runtime.
+const CDC_MUTATION_BATCH_SIZE_ENV_VAR: &str = "ETL_CDC_MUTATION_BATCH_SIZE";
+
+/// Resolves the CDC mutation batch size, honoring
+/// `ETL_CDC_MUTATION_BATCH_SIZE` (read once) and falling back to
+/// [`CDC_MUTATION_BATCH_SIZE`]. Values below 1 are ignored.
+fn cdc_mutation_batch_size() -> usize {
+    static SIZE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var(CDC_MUTATION_BATCH_SIZE_ENV_VAR)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(CDC_MUTATION_BATCH_SIZE)
+    });
+
+    *SIZE
+}
 /// ETL-managed marker table storing per-table applied copy batches.
 const APPLIED_BATCHES_TABLE: &str = "__etl_applied_table_batches";
 /// Data inlining limit for append-only DuckLake helper tables.
@@ -733,9 +754,10 @@ pub(super) fn prepare_mutation_table_batches(
     let mut prepared_batches = Vec::new();
     let mut pending_mutations = Vec::new();
 
+    let batch_size = cdc_mutation_batch_size();
     for tracked_mutation in tracked_mutations {
         pending_mutations.push(tracked_mutation);
-        if pending_mutations.len() >= CDC_MUTATION_BATCH_SIZE {
+        if pending_mutations.len() >= batch_size {
             push_prepared_mutation_batch(
                 &mut prepared_batches,
                 replicated_table_schema,
