@@ -40,7 +40,7 @@ ApiPipelineConfig {
         IncludeAllTables,
     ),
     invalidated_slot_behavior: Some(
-        Error,
+        Recreate,
     ),
     replicator_resources: None,
     ducklake_maintenance: None,
