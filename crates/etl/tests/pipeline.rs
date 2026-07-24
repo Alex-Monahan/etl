@@ -38,7 +38,7 @@ use etl_postgres::{
     below_version,
     slots::EtlReplicationSlot,
     tokio::test_utils::{ReplicationSlotState, id_column_schema},
-    version::POSTGRES_15,
+    version::{POSTGRES_15, POSTGRES_17},
 };
 use etl_telemetry::tracing::init_test_tracing;
 use pg_escape::{quote_identifier, quote_literal};
@@ -325,6 +325,62 @@ where
     ) -> EtlResult<()> {
         self.inner.write_events(events, durability, async_result).await
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn apply_worker_slot_is_configured_as_failover_slot() {
+    init_test_tracing();
+
+    let database = spawn_source_database().await;
+
+    // Failover slots require PostgreSQL 17+ (`ALTER_REPLICATION_SLOT ... FAILOVER`).
+    // On older servers the fork intentionally skips the configuration, so there
+    // is nothing to assert.
+    if below_version!(database.server_version(), POSTGRES_17) {
+        return;
+    }
+
+    let database_schema = setup_test_database_schema(&database, TableSelection::UsersOnly).await;
+
+    let store = NotifyingStore::new();
+    let destination = TestDestinationWrapper::wrap(MemoryDestination::new(store.clone()));
+
+    let pipeline_id: PipelineId = random();
+    let mut pipeline = create_pipeline(
+        &database.config,
+        pipeline_id,
+        database_schema.publication_name(),
+        store.clone(),
+        destination.clone(),
+    );
+
+    let table_ready_notify = store
+        .notify_on_table_state_type(database_schema.users_schema().id, TableStateType::Ready)
+        .await;
+
+    pipeline.start().await.unwrap();
+    table_ready_notify.notified().await;
+
+    pipeline.shutdown_and_wait().await.unwrap();
+
+    // The apply worker slot must be marked as a failover slot so it survives a
+    // source promotion. This guards the fork's `ensure_failover_slot` behavior
+    // in the apply worker against upstream changes to slot handling.
+    let apply_slot_name: String =
+        EtlReplicationSlot::for_apply_worker(pipeline_id).try_into().unwrap();
+    let failover: bool = database
+        .client
+        .as_ref()
+        .unwrap()
+        .query_one(
+            "select failover from pg_replication_slots where slot_name = $1",
+            &[&apply_slot_name],
+        )
+        .await
+        .unwrap()
+        .get(0);
+
+    assert!(failover, "apply worker slot {apply_slot_name} should be a failover slot");
 }
 
 #[tokio::test(flavor = "multi_thread")]

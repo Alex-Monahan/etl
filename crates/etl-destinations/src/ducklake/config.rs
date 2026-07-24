@@ -1472,4 +1472,115 @@ mod tests {
         );
         assert!(sql.contains(&format!("METADATA_SCHEMA {}", quote_literal(metadata_schema))));
     }
+
+    #[test]
+    fn motherduck_database_name_parses_native_and_legacy_forms() {
+        assert_eq!(
+            motherduck_database_name(&Url::parse("md:my_db").unwrap()),
+            "my_db"
+        );
+        assert_eq!(
+            motherduck_database_name(&Url::parse("motherduck:my_db").unwrap()),
+            "my_db"
+        );
+        assert_eq!(
+            motherduck_database_name(&Url::parse("md:__ducklake_metadata_my_db").unwrap()),
+            "my_db"
+        );
+    }
+
+    #[test]
+    fn native_motherduck_setup_plan_skips_ducklake_options() {
+        let catalog_url = Url::parse("md:my_db").unwrap();
+        let data_url = Url::parse("md:my_db").unwrap();
+
+        let plan = build_setup_plan_with_strategy(
+            &catalog_url,
+            &data_url,
+            None,
+            None,
+            DuckDbExtensionStrategy::InstallFromRepository,
+            None,
+            crate::ducklake::COPY_DATA_INLINING_ROW_LIMIT,
+            // Native MotherDuck database mode (the default): motherduck_use_ducklake == false.
+            false,
+        )
+        .unwrap();
+
+        // Native mode attaches the MotherDuck database directly and skips every
+        // DuckLake-only phase (no ducklake extension, no configure_parquet).
+        let labels: Vec<&str> = plan.steps().iter().map(|step| step.label).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "configure_writer_session",
+                "configure_resource_limits",
+                "load_extensions",
+                "attach_catalog",
+            ]
+        );
+
+        let load_extensions = &plan.steps()[2].sql;
+        assert!(load_extensions.contains("INSTALL motherduck"));
+        assert!(
+            !load_extensions.contains("ducklake"),
+            "native mode must not install/load the ducklake extension: {load_extensions}"
+        );
+
+        let attach = &plan.steps()[3].sql;
+        assert!(
+            attach.contains(&quote_literal("md:my_db")),
+            "native mode must attach the raw md: database: {attach}"
+        );
+        assert!(
+            !attach.contains("ducklake:"),
+            "native mode must not attach a ducklake catalog: {attach}"
+        );
+
+        assert!(
+            plan.steps().iter().all(|step| step.label != "configure_parquet"),
+            "native mode must skip the DuckLake-only parquet configuration phase"
+        );
+    }
+
+    #[test]
+    fn ducklake_motherduck_setup_plan_uses_managed_catalog() {
+        let catalog_url = Url::parse("md:my_db").unwrap();
+        let data_url = Url::parse("md:my_db").unwrap();
+
+        let plan = build_setup_plan_with_strategy(
+            &catalog_url,
+            &data_url,
+            None,
+            None,
+            DuckDbExtensionStrategy::InstallFromRepository,
+            None,
+            crate::ducklake::COPY_DATA_INLINING_ROW_LIMIT,
+            // Managed DuckLake opt-in: motherduck_use_ducklake == true.
+            true,
+        )
+        .unwrap();
+
+        let labels: Vec<&str> = plan.steps().iter().map(|step| step.label).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "configure_writer_session",
+                "configure_resource_limits",
+                "load_extensions",
+                "attach_catalog",
+                "configure_parquet",
+            ]
+        );
+
+        let load_extensions = &plan.steps()[2].sql;
+        assert!(load_extensions.contains("INSTALL ducklake"));
+        assert!(load_extensions.contains("INSTALL motherduck"));
+
+        let attach = &plan.steps()[3].sql;
+        assert!(
+            attach.contains("ducklake:md:__ducklake_metadata_my_db"),
+            "ducklake mode must attach the managed ducklake catalog: {attach}"
+        );
+    }
 }

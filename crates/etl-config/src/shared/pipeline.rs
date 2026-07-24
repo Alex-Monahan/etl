@@ -540,6 +540,14 @@ mod tests {
     }
 
     #[test]
+    fn invalidated_slot_behavior_defaults_to_recreate() {
+        // The fork defaults slot-invalidation handling to `Recreate` so a slot
+        // invalidated by WAL retention self-heals via a full re-backfill instead
+        // of stopping the pipeline. Guards against a regression back to `Error`.
+        assert_eq!(InvalidatedSlotBehavior::default(), InvalidatedSlotBehavior::Recreate);
+    }
+
+    #[test]
     fn batch_config_deserializes_without_max_bytes() {
         let json = r#"{"max_fill_ms":5000,"memory_budget_ratio":0.2}"#;
         let config: BatchConfig = serde_json::from_str(json).unwrap();

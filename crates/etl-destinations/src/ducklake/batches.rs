@@ -3440,4 +3440,23 @@ mod tests {
 
         assert_ne!(first.batch_id, second.batch_id);
     }
+
+    #[test]
+    fn cdc_mutation_batch_size_honors_env_override() {
+        // The per-DuckLake-transaction mutation group size must remain tunable at
+        // runtime via `ETL_CDC_MUTATION_BATCH_SIZE`. This guards the fork's
+        // configurable-batch-size behavior against regressions.
+        //
+        // `cdc_mutation_batch_size` memoizes its first read with `LazyLock`, and
+        // nextest runs every test in its own process, so setting the override
+        // before the first call in this dedicated process is deterministic.
+        let override_value = CDC_MUTATION_BATCH_SIZE + 100;
+        // SAFETY: the test owns this process under nextest; no other thread reads
+        // the environment concurrently before the value is set.
+        unsafe {
+            std::env::set_var(CDC_MUTATION_BATCH_SIZE_ENV_VAR, override_value.to_string());
+        }
+
+        assert_eq!(cdc_mutation_batch_size(), override_value);
+    }
 }
