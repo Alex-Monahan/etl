@@ -43,8 +43,8 @@ use url::Url;
 
 use crate::{
     ducklake::{
-        ATTACH_DATA_INLINING_ROW_LIMIT, COPY_DATA_INLINING_ROW_LIMIT, DuckLakeTableName,
-        LAKE_CATALOG, S3Config,
+        COPY_DATA_INLINING_ROW_LIMIT, DuckLakeTableName, LAKE_CATALOG, S3Config,
+        attach_data_inlining_row_limit,
         batches::{
             TableMutation, TrackedTableMutation, TrackedTruncateEvent,
             apply_table_batch_with_retry, apply_table_batches_with_retry,
@@ -1116,7 +1116,7 @@ where
         // MotherDuck later materializes. Force the copy pool to inline as well,
         // instead of the default row limit of zero that writes Parquet directly.
         let copy_data_inlining_row_limit = if is_motherduck {
-            ATTACH_DATA_INLINING_ROW_LIMIT
+            attach_data_inlining_row_limit()
         } else {
             COPY_DATA_INLINING_ROW_LIMIT
         };
@@ -1125,7 +1125,7 @@ where
             &data_path,
             s3.as_ref(),
             metadata_schema.as_deref(),
-            ATTACH_DATA_INLINING_ROW_LIMIT,
+            attach_data_inlining_row_limit(),
             is_ducklake,
         )?);
         let copy_setup_plan = Arc::new(build_setup_plan(

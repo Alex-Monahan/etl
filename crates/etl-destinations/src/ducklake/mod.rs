@@ -97,6 +97,25 @@ impl fmt::Display for DuckLakeTableName {
 /// materialized to Parquet by an external maintenance job.
 pub(super) const ATTACH_DATA_INLINING_ROW_LIMIT: u64 = 1_000_000;
 
+/// Environment variable overriding [`ATTACH_DATA_INLINING_ROW_LIMIT`].
+const ATTACH_DATA_INLINING_ROW_LIMIT_ENV_VAR: &str = "ETL_ATTACH_DATA_INLINING_ROW_LIMIT";
+
+/// Resolves the attach-level data inlining limit, honoring
+/// `ETL_ATTACH_DATA_INLINING_ROW_LIMIT` (read once) and falling back to
+/// [`ATTACH_DATA_INLINING_ROW_LIMIT`]. Lowering it forces rows past the limit
+/// to be written as Parquet data files instead of inlined into the catalog,
+/// which requires a DuckLake whose storage accepts external Parquet writes.
+pub(super) fn attach_data_inlining_row_limit() -> u64 {
+    static LIMIT: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        std::env::var(ATTACH_DATA_INLINING_ROW_LIMIT_ENV_VAR)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(ATTACH_DATA_INLINING_ROW_LIMIT)
+    });
+
+    *LIMIT
+}
+
 /// Connection-level DuckLake data inlining limit during initial copies.
 ///
 /// COPY uses a dedicated connection pool attached with this limit so its
