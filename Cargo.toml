@@ -87,7 +87,7 @@ etl-postgres = { path = "crates/etl-postgres", default-features = false }
 etl-telemetry = { path = "crates/etl-telemetry", default-features = false }
 fail = { version = "0.5.1", default-features = false }
 futures = { version = "0.3.31", default-features = false }
-gcp-bigquery-client = { git = "https://github.com/iambriccardo/gcp-bigquery-client", rev = "e9066537b8483f32f1e89d910b1b5d575ebbbdf7", default-features = false }
+gcp-bigquery-client = { git = "https://github.com/iambriccardo/gcp-bigquery-client", rev = "4407c2e325084713fa16219494251217054a98c8", default-features = false }
 hex = { version = "0.4", default-features = false }
 humantime = { version = "2.3.0", default-features = false }
 iceberg = { version = "0.8.0", default-features = false }
@@ -121,6 +121,7 @@ sentry = { version = "0.42.0" }
 serde = { version = "1.0.219", default-features = false }
 serde_json = { version = "1.0.141", default-features = false }
 sha2 = { version = "0.11", default-features = false }
+simdutf8 = { version = "0.1.5" }
 sqlx = { version = "0.9.0", default-features = false }
 sysinfo = { version = "0.38.2", default-features = false }
 tempfile = { version = "3.23.0", default-features = false }
