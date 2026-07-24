@@ -56,7 +56,7 @@ const fn default_table_sync_copy() -> TableSyncCopyConfig {
 }
 
 const fn default_invalidated_slot_behavior() -> InvalidatedSlotBehavior {
-    InvalidatedSlotBehavior::Error
+    InvalidatedSlotBehavior::Recreate
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, PartialEq)]
@@ -741,7 +741,7 @@ mod tests {
             PipelineConfig::DEFAULT_REPLICATION_LAG_REFRESH_INTERVAL_MS
         );
         assert_eq!(stored.memory_backpressure, None);
-        assert_eq!(stored.invalidated_slot_behavior, InvalidatedSlotBehavior::Error);
+        assert_eq!(stored.invalidated_slot_behavior, InvalidatedSlotBehavior::Recreate);
     }
 
     #[test]

@@ -1112,6 +1112,10 @@ impl StoredDestinationConfig {
                 s3_url_style,
                 s3_use_ssl,
                 metadata_schema,
+                // The managed API does not yet expose an external metadata
+                // catalog or native MotherDuck mode; preserve prior behavior.
+                metadata_catalog_url: None,
+                motherduck_use_ducklake: false,
                 maintenance_target_file_size,
                 expire_snapshots_older_than,
                 maintenance_mode,
