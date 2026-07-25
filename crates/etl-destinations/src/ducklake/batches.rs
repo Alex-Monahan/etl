@@ -84,16 +84,47 @@ const CDC_MUTATION_BATCH_SIZE: usize = 16;
 /// Environment variable overriding [`CDC_MUTATION_BATCH_SIZE`] at runtime.
 const CDC_MUTATION_BATCH_SIZE_ENV_VAR: &str = "ETL_CDC_MUTATION_BATCH_SIZE";
 
+/// Upper bound on the CDC mutation batch size.
+///
+/// Guards against a single oversized DuckLake transaction / retry unit from a
+/// mistyped override.
+const CDC_MUTATION_BATCH_SIZE_MAX: usize = 100_000;
+
+/// Parses a CDC mutation batch size, accepting only integers in
+/// `[1, CDC_MUTATION_BATCH_SIZE_MAX]` and falling back to
+/// [`CDC_MUTATION_BATCH_SIZE`] for missing, empty, or out-of-range input.
+///
+/// Pure so it can be unit-tested without mutating process-global environment
+/// state (which would poison the memoized [`cdc_mutation_batch_size`]).
+fn parse_cdc_mutation_batch_size(raw: Option<&str>) -> usize {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&n| (1..=CDC_MUTATION_BATCH_SIZE_MAX).contains(&n))
+        .unwrap_or(CDC_MUTATION_BATCH_SIZE)
+}
+
 /// Resolves the CDC mutation batch size, honoring
-/// `ETL_CDC_MUTATION_BATCH_SIZE` (read once) and falling back to
-/// [`CDC_MUTATION_BATCH_SIZE`]. Values below 1 are ignored.
+/// `ETL_CDC_MUTATION_BATCH_SIZE` (read once). Invalid values are ignored with a
+/// warning and fall back to [`CDC_MUTATION_BATCH_SIZE`].
 fn cdc_mutation_batch_size() -> usize {
     static SIZE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        std::env::var(CDC_MUTATION_BATCH_SIZE_ENV_VAR)
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or(CDC_MUTATION_BATCH_SIZE)
+        let raw = std::env::var(CDC_MUTATION_BATCH_SIZE_ENV_VAR).ok();
+        let size = parse_cdc_mutation_batch_size(raw.as_deref());
+        if let Some(raw) = raw.as_deref() {
+            let valid = raw
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .is_some_and(|n| (1..=CDC_MUTATION_BATCH_SIZE_MAX).contains(&n));
+            if !raw.trim().is_empty() && !valid {
+                tracing::warn!(
+                    value = %raw,
+                    "invalid {CDC_MUTATION_BATCH_SIZE_ENV_VAR}; using default {size}"
+                );
+            }
+        }
+        size
     });
 
     *SIZE
@@ -3442,21 +3473,31 @@ mod tests {
     }
 
     #[test]
-    fn cdc_mutation_batch_size_honors_env_override() {
-        // The per-DuckLake-transaction mutation group size must remain tunable at
-        // runtime via `ETL_CDC_MUTATION_BATCH_SIZE`. This guards the fork's
-        // configurable-batch-size behavior against regressions.
-        //
-        // `cdc_mutation_batch_size` memoizes its first read with `LazyLock`, and
-        // nextest runs every test in its own process, so setting the override
-        // before the first call in this dedicated process is deterministic.
-        let override_value = CDC_MUTATION_BATCH_SIZE + 100;
-        // SAFETY: the test owns this process under nextest; no other thread reads
-        // the environment concurrently before the value is set.
-        unsafe {
-            std::env::set_var(CDC_MUTATION_BATCH_SIZE_ENV_VAR, override_value.to_string());
-        }
+    fn parse_cdc_mutation_batch_size_accepts_valid_and_rejects_invalid() {
+        // Valid in-range overrides are honored. Tested on the pure parser so the
+        // process-global `LazyLock` in `cdc_mutation_batch_size` is never
+        // memoized here (that would poison other tests in the same process).
+        assert_eq!(parse_cdc_mutation_batch_size(Some("116")), 116);
+        assert_eq!(parse_cdc_mutation_batch_size(Some(" 32 ")), 32);
+        assert_eq!(
+            parse_cdc_mutation_batch_size(Some(CDC_MUTATION_BATCH_SIZE_MAX.to_string().as_str())),
+            CDC_MUTATION_BATCH_SIZE_MAX
+        );
 
-        assert_eq!(cdc_mutation_batch_size(), override_value);
+        // Missing, empty, non-numeric, zero, negative, and out-of-range inputs
+        // all fall back to the default instead of silently misbehaving.
+        for invalid in [None, Some(""), Some("  "), Some("abc"), Some("0"), Some("-5")] {
+            assert_eq!(parse_cdc_mutation_batch_size(invalid), CDC_MUTATION_BATCH_SIZE);
+        }
+        assert_eq!(
+            parse_cdc_mutation_batch_size(Some(
+                (CDC_MUTATION_BATCH_SIZE_MAX + 1).to_string().as_str()
+            )),
+            CDC_MUTATION_BATCH_SIZE
+        );
+        assert_eq!(
+            parse_cdc_mutation_batch_size(Some("999999999999999999999999")),
+            CDC_MUTATION_BATCH_SIZE
+        );
     }
 }

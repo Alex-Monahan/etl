@@ -100,17 +100,41 @@ pub(super) const ATTACH_DATA_INLINING_ROW_LIMIT: u64 = 1_000_000;
 /// Environment variable overriding [`ATTACH_DATA_INLINING_ROW_LIMIT`].
 const ATTACH_DATA_INLINING_ROW_LIMIT_ENV_VAR: &str = "ETL_ATTACH_DATA_INLINING_ROW_LIMIT";
 
+/// Parses an attach-level data inlining limit, accepting only integers `>= 1`
+/// and falling back to [`ATTACH_DATA_INLINING_ROW_LIMIT`] for missing, empty,
+/// or out-of-range input.
+///
+/// `0` is rejected: it would force every write to Parquet, which a
+/// MotherDuck-managed DuckLake (managed storage) cannot accept. Pure so it can
+/// be unit-tested without mutating process-global environment state.
+fn parse_attach_data_inlining_row_limit(raw: Option<&str>) -> u64 {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(ATTACH_DATA_INLINING_ROW_LIMIT)
+}
+
 /// Resolves the attach-level data inlining limit, honoring
 /// `ETL_ATTACH_DATA_INLINING_ROW_LIMIT` (read once) and falling back to
-/// [`ATTACH_DATA_INLINING_ROW_LIMIT`]. Lowering it forces rows past the limit
-/// to be written as Parquet data files instead of inlined into the catalog,
-/// which requires a DuckLake whose storage accepts external Parquet writes.
+/// [`ATTACH_DATA_INLINING_ROW_LIMIT`]. Lowering it (to `>= 1`) forces rows past
+/// the limit to be written as Parquet data files instead of inlined into the
+/// catalog, which requires a DuckLake whose storage accepts external Parquet
+/// writes. Invalid values are ignored with a warning.
 pub(super) fn attach_data_inlining_row_limit() -> u64 {
     static LIMIT: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
-        std::env::var(ATTACH_DATA_INLINING_ROW_LIMIT_ENV_VAR)
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(ATTACH_DATA_INLINING_ROW_LIMIT)
+        let raw = std::env::var(ATTACH_DATA_INLINING_ROW_LIMIT_ENV_VAR).ok();
+        let limit = parse_attach_data_inlining_row_limit(raw.as_deref());
+        if let Some(raw) = raw.as_deref() {
+            let valid = raw.trim().parse::<u64>().ok().is_some_and(|n| n >= 1);
+            if !raw.trim().is_empty() && !valid {
+                tracing::warn!(
+                    value = %raw,
+                    "invalid {ATTACH_DATA_INLINING_ROW_LIMIT_ENV_VAR}; using default {limit}"
+                );
+            }
+        }
+        limit
     });
 
     *LIMIT
@@ -154,3 +178,20 @@ pub use external_maintenance::{
     ExternalMaintenanceStore, ExternalMaintenanceWatcherConfig, PostgresExternalMaintenanceStore,
     run_external_maintenance_watcher,
 };
+
+#[cfg(test)]
+mod inlining_tests {
+    use super::{ATTACH_DATA_INLINING_ROW_LIMIT, parse_attach_data_inlining_row_limit};
+
+    #[test]
+    fn parse_attach_data_inlining_row_limit_rejects_zero_and_invalid() {
+        assert_eq!(parse_attach_data_inlining_row_limit(Some("10")), 10);
+        assert_eq!(parse_attach_data_inlining_row_limit(Some(" 1000000 ")), 1_000_000);
+        for invalid in [None, Some(""), Some("0"), Some("-1"), Some("abc")] {
+            assert_eq!(
+                parse_attach_data_inlining_row_limit(invalid),
+                ATTACH_DATA_INLINING_ROW_LIMIT
+            );
+        }
+    }
+}

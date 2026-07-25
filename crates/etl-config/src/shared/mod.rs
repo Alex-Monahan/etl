@@ -14,7 +14,8 @@ pub use connection::{
 };
 pub use destination::{
     ClickHouseEngine, DestinationConfig, DestinationConfigWithoutSecrets, DestinationKind,
-    DuckLakeMaintenanceMode, IcebergConfig, IcebergConfigWithoutSecrets,
+    DuckLakeMaintenanceMode, IcebergConfig, IcebergConfigWithoutSecrets, MotherDuckConfig,
+    MotherDuckConfigWithoutSecrets,
 };
 pub use pipeline::{
     BatchConfig, InvalidatedSlotBehavior, MemoryBackpressureConfig, PipelineConfig,

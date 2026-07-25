@@ -1166,60 +1166,61 @@ where
         // catalog options; a native MotherDuck database has neither, so skip this
         // whole setup block for native mode.
         if is_ducklake {
-        // `target_file_size` is a catalog-wide DuckLake option consumed during
-        // compaction. Apply it once on the write pool so foreground writes and
-        // external maintenance jobs use the same configured catalog option.
-        let target_file_size_sql =
-            maintenance_target_file_size_sql(Some(maintenance_target_file_size.as_ref()));
-        run_duckdb_blocking(
-            Arc::clone(&pool),
-            Arc::clone(&blocking_slots),
-            move |conn| -> EtlResult<()> {
-                conn.execute_batch(&target_file_size_sql).map_err(|error| {
-                    etl_error!(
-                        ErrorKind::DestinationQueryFailed,
-                        "DuckLake target_file_size configuration failed",
-                        source: error
-                    )
-                })?;
-                Ok(())
-            },
-        )
-        .await?;
-        let expire_snapshots_validation_sql =
-            validate_expire_snapshots_older_than_sql(expire_snapshots_older_than.as_ref());
-        let expire_snapshots_older_than_for_error = Arc::clone(&expire_snapshots_older_than);
-        run_duckdb_blocking(
-            Arc::clone(&pool),
-            Arc::clone(&blocking_slots),
-            move |conn| -> EtlResult<()> {
-                let retention_is_safe: bool = conn
-                    .query_row(&expire_snapshots_validation_sql, [], |row| row.get(0))
-                    .map_err(|source| {
+            // `target_file_size` is a catalog-wide DuckLake option consumed during
+            // compaction. Apply it once on the write pool so foreground writes and
+            // external maintenance jobs use the same configured catalog option.
+            let target_file_size_sql =
+                maintenance_target_file_size_sql(Some(maintenance_target_file_size.as_ref()));
+            run_duckdb_blocking(
+                Arc::clone(&pool),
+                Arc::clone(&blocking_slots),
+                move |conn| -> EtlResult<()> {
+                    conn.execute_batch(&target_file_size_sql).map_err(|error| {
                         etl_error!(
+                            ErrorKind::DestinationQueryFailed,
+                            "DuckLake target_file_size configuration failed",
+                            source: error
+                        )
+                    })?;
+                    Ok(())
+                },
+            )
+            .await?;
+            let expire_snapshots_validation_sql =
+                validate_expire_snapshots_older_than_sql(expire_snapshots_older_than.as_ref());
+            let expire_snapshots_older_than_for_error = Arc::clone(&expire_snapshots_older_than);
+            run_duckdb_blocking(
+                Arc::clone(&pool),
+                Arc::clone(&blocking_slots),
+                move |conn| -> EtlResult<()> {
+                    let retention_is_safe: bool = conn
+                        .query_row(&expire_snapshots_validation_sql, [], |row| row.get(0))
+                        .map_err(|source| {
+                            etl_error!(
+                                ErrorKind::ConfigError,
+                                "DuckLake expire_snapshots_older_than configuration failed",
+                                format!(
+                                    "Invalid expire_snapshots_older_than value `{}`",
+                                    expire_snapshots_older_than_for_error
+                                ),
+                                source: source
+                            )
+                        })?;
+                    if !retention_is_safe {
+                        return Err(etl_error!(
                             ErrorKind::ConfigError,
                             "DuckLake expire_snapshots_older_than configuration failed",
                             format!(
-                                "Invalid expire_snapshots_older_than value `{}`",
+                                "Snapshot retention must be at least {}, got `{}`",
+                                MIN_EXPIRE_SNAPSHOTS_OLDER_THAN,
                                 expire_snapshots_older_than_for_error
-                            ),
-                            source: source
-                        )
-                    })?;
-                if !retention_is_safe {
-                    return Err(etl_error!(
-                        ErrorKind::ConfigError,
-                        "DuckLake expire_snapshots_older_than configuration failed",
-                        format!(
-                            "Snapshot retention must be at least {}, got `{}`",
-                            MIN_EXPIRE_SNAPSHOTS_OLDER_THAN, expire_snapshots_older_than_for_error
-                        )
-                    ));
-                }
-                Ok(())
-            },
-        )
-        .await?;
+                            )
+                        ));
+                    }
+                    Ok(())
+                },
+            )
+            .await?;
         } // end if is_ducklake (DuckLake-only catalog options)
         let metadata_schema = match metadata_schema {
             Some(metadata_schema) => metadata_schema,

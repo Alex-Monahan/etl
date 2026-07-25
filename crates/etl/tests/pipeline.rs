@@ -334,9 +334,9 @@ async fn apply_worker_slot_is_configured_as_failover_slot() {
 
     let database = spawn_source_database().await;
 
-    // Failover slots require PostgreSQL 17+ (`ALTER_REPLICATION_SLOT ... FAILOVER`).
-    // On older servers the fork intentionally skips the configuration, so there
-    // is nothing to assert.
+    // Failover slots require PostgreSQL 17+ (`ALTER_REPLICATION_SLOT ...
+    // FAILOVER`). On older servers the fork intentionally skips the
+    // configuration, so there is nothing to assert.
     if below_version!(database.server_version(), POSTGRES_17) {
         return;
     }

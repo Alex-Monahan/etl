@@ -199,96 +199,149 @@ mod ducklake {
     ) -> ReplicatorResult<()> {
         let pipeline_id = replicator_config.pipeline.id;
 
-        let DestinationConfig::Ducklake {
-            catalog_url,
-            metadata_catalog_url,
-            data_path,
-            pool_size,
-            s3_access_key_id,
-            s3_secret_access_key,
-            s3_region,
-            s3_endpoint,
-            s3_url_style,
-            s3_use_ssl,
-            metadata_schema,
-            maintenance_target_file_size,
-            expire_snapshots_older_than,
-            maintenance_mode,
-            motherduck_use_ducklake,
-        } = &replicator_config.destination
-        else {
-            unreachable!("Destination kind should match DuckLake config");
-        };
+        // `kind()` maps both the self-hosted DuckLake and the fork's MotherDuck
+        // destination to `DestinationKind::Ducklake`, so this entrypoint handles
+        // both config variants. Each builds the shared
+        // `new_with_external_maintenance` inputs from its own typed config.
+        let destination =
+            match &replicator_config.destination {
+                DestinationConfig::Ducklake {
+                    catalog_url,
+                    data_path,
+                    pool_size,
+                    s3_access_key_id,
+                    s3_secret_access_key,
+                    s3_region,
+                    s3_endpoint,
+                    s3_url_style,
+                    s3_use_ssl,
+                    metadata_schema,
+                    maintenance_target_file_size,
+                    expire_snapshots_older_than,
+                    maintenance_mode,
+                } => {
+                    let catalog_url = parse_ducklake_url(catalog_url.expose_secret())
+                        .map_err(ReplicatorError::config)?;
+                    let data_path =
+                        parse_ducklake_s3_data_path(data_path).map_err(ReplicatorError::config)?;
 
-        // A MotherDuck-managed DuckLake owns its storage and metadata, so it
-        // takes no `data_path` and no S3 credentials. The metadata bookkeeping
-        // catalog is supplied separately via `metadata_catalog_url`.
-        let catalog_url =
-            parse_ducklake_url(catalog_url.expose_secret()).map_err(ReplicatorError::config)?;
-        let is_motherduck = matches!(catalog_url.scheme(), "md" | "motherduck");
+                    let s3_config = match (s3_access_key_id, s3_secret_access_key) {
+                        (Some(access_key_id), Some(secret_access_key)) => Some(DucklakeS3Config {
+                            access_key_id: access_key_id.expose_secret().to_owned(),
+                            secret_access_key: secret_access_key.expose_secret().to_owned(),
+                            region: s3_region.clone().unwrap_or_else(|| "us-east-1".to_owned()),
+                            endpoint: s3_endpoint.clone(),
+                            url_style: s3_url_style.clone().unwrap_or_else(|| {
+                                default_ducklake_s3_url_style(s3_endpoint.as_deref()).to_owned()
+                            }),
+                            use_ssl: s3_use_ssl.unwrap_or_else(default_ducklake_s3_use_ssl),
+                        }),
+                        (None, None) => None,
+                        _ => {
+                            return Err(ReplicatorError::config(std::io::Error::other(
+                                "DuckLake S3 credentials must include both access key id and \
+                                 secret access key",
+                            )));
+                        }
+                    };
 
-        let metadata_catalog_url = match metadata_catalog_url {
-            Some(url) => {
-                Some(parse_ducklake_url(url.expose_secret()).map_err(ReplicatorError::config)?)
-            }
-            None => None,
-        };
+                    let maintenance_mode = to_maintenance_mode(*maintenance_mode);
+                    let external_maintenance =
+                        DuckLakeExternalMaintenanceConfig { mode: maintenance_mode, pipeline_id };
 
-        let data_path = if is_motherduck {
-            // Placeholder that is never used by the MotherDuck attach path.
-            parse_ducklake_url("md:managed").map_err(ReplicatorError::config)?
-        } else {
-            parse_ducklake_s3_data_path(data_path).map_err(ReplicatorError::config)?
-        };
+                    DuckLakeDestination::new_with_external_maintenance(
+                        catalog_url,
+                        None,
+                        data_path,
+                        *pool_size,
+                        s3_config,
+                        metadata_schema.clone(),
+                        maintenance_target_file_size.clone(),
+                        expire_snapshots_older_than.clone(),
+                        false,
+                        external_maintenance,
+                        store.clone(),
+                    )
+                    .await?
+                }
+                DestinationConfig::MotherDuck(config) => {
+                    if config.database.trim().is_empty() {
+                        return Err(ReplicatorError::config(std::io::Error::other(
+                            "MotherDuck destination requires a non-empty `database`",
+                        )));
+                    }
 
-        let s3_config = if is_motherduck {
-            None
-        } else {
-            match (s3_access_key_id, s3_secret_access_key) {
-            (Some(access_key_id), Some(secret_access_key)) => Some(DucklakeS3Config {
-                access_key_id: access_key_id.expose_secret().to_owned(),
-                secret_access_key: secret_access_key.expose_secret().to_owned(),
-                region: s3_region.clone().unwrap_or_else(|| "us-east-1".to_owned()),
-                endpoint: s3_endpoint.clone(),
-                url_style: s3_url_style.clone().unwrap_or_else(|| {
-                    default_ducklake_s3_url_style(s3_endpoint.as_deref()).to_owned()
-                }),
-                use_ssl: s3_use_ssl.unwrap_or_else(default_ducklake_s3_use_ssl),
-            }),
-            (None, None) => None,
-            _ => {
-                return Err(ReplicatorError::config(std::io::Error::other(
-                    "DuckLake S3 credentials must include both access key id and secret access key",
-                )));
-            }
-            }
-        };
+                    // Build the catalog URL from the bare database name, so no string
+                    // surgery on a user-supplied URL can redirect writes to the wrong
+                    // database.
+                    let catalog_url = parse_ducklake_url(&format!("md:{}", config.database))
+                        .map_err(ReplicatorError::config)?;
+                    let metadata_catalog_url =
+                        parse_ducklake_url(config.metadata_catalog_url.expose_secret())
+                            .map_err(ReplicatorError::config)?;
 
-        let maintenance_mode = match maintenance_mode {
-            ConfigDuckLakeMaintenanceMode::Disabled => DuckLakeMaintenanceMode::Disabled,
-            ConfigDuckLakeMaintenanceMode::Kubernetes => DuckLakeMaintenanceMode::Kubernetes,
-            ConfigDuckLakeMaintenanceMode::Postgres => DuckLakeMaintenanceMode::Postgres,
-        };
-        let external_maintenance =
-            DuckLakeExternalMaintenanceConfig { mode: maintenance_mode, pipeline_id };
+                    // Namespace ETL bookkeeping (the replay-epoch catalog) per
+                    // destination database so distinct MotherDuck destinations sharing
+                    // one `metadata_catalog_url` never collide on the same table name.
+                    let metadata_schema =
+                        Some(config.metadata_schema.clone().unwrap_or_else(|| {
+                            default_motherduck_metadata_schema(&config.database)
+                        }));
 
-        let destination = DuckLakeDestination::new_with_external_maintenance(
-            catalog_url,
-            metadata_catalog_url,
-            data_path,
-            *pool_size,
-            s3_config,
-            metadata_schema.clone(),
-            maintenance_target_file_size.clone(),
-            expire_snapshots_older_than.clone(),
-            *motherduck_use_ducklake,
-            external_maintenance,
-            store.clone(),
-        )
-        .await?;
+                    // MotherDuck manages its own storage/maintenance, so the data path
+                    // is unused and external maintenance is always disabled.
+                    let data_path =
+                        parse_ducklake_url("md:managed").map_err(ReplicatorError::config)?;
+                    let external_maintenance = DuckLakeExternalMaintenanceConfig {
+                        mode: DuckLakeMaintenanceMode::Disabled,
+                        pipeline_id,
+                    };
+
+                    DuckLakeDestination::new_with_external_maintenance(
+                        catalog_url,
+                        Some(metadata_catalog_url),
+                        data_path,
+                        config.pool_size,
+                        None,
+                        metadata_schema,
+                        None,
+                        None,
+                        config.use_ducklake,
+                        external_maintenance,
+                        store.clone(),
+                    )
+                    .await?
+                }
+                _ => unreachable!("Destination kind should match DuckLake or MotherDuck config"),
+            };
 
         let pipeline = Pipeline::new(replicator_config.pipeline, store, destination);
         pipeline::start(pipeline).await
+    }
+
+    /// Maps the config maintenance mode to the destination maintenance mode.
+    fn to_maintenance_mode(mode: ConfigDuckLakeMaintenanceMode) -> DuckLakeMaintenanceMode {
+        match mode {
+            ConfigDuckLakeMaintenanceMode::Disabled => DuckLakeMaintenanceMode::Disabled,
+            ConfigDuckLakeMaintenanceMode::Kubernetes => DuckLakeMaintenanceMode::Kubernetes,
+            ConfigDuckLakeMaintenanceMode::Postgres => DuckLakeMaintenanceMode::Postgres,
+        }
+    }
+
+    /// Derives a per-database bookkeeping schema for a MotherDuck destination.
+    ///
+    /// Distinct destinations that share one `metadata_catalog_url` must not
+    /// share a replay-epoch table, so the default schema embeds the (sanitized)
+    /// database name. Non-identifier characters are replaced with `_`.
+    fn default_motherduck_metadata_schema(database: &str) -> String {
+        let sanitized: String =
+            database
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '_' { c.to_ascii_lowercase() } else { '_' }
+                })
+                .collect();
+        format!("etl_md_{sanitized}")
     }
 }
 

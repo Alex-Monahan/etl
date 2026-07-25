@@ -62,6 +62,67 @@ pub enum DuckLakeMaintenanceMode {
     Postgres,
 }
 
+/// Configuration for the MotherDuck destination (fork extension).
+///
+/// Kept as a dedicated struct so all MotherDuck-specific fields live together
+/// and out of upstream's [`DestinationConfig::Ducklake`] variant, keeping the
+/// fork's merge surface minimal. MotherDuck never runs external maintenance, so
+/// no maintenance mode is exposed here.
+///
+/// This intentionally does not implement [`Serialize`] to avoid leaking the
+/// `metadata_catalog_url` secret; see [`MotherDuckConfigWithoutSecrets`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct MotherDuckConfig {
+    /// MotherDuck database name (the `md:<database>` target). A bare database
+    /// name, not a URL.
+    pub database: String,
+    /// Target a MotherDuck-managed DuckLake
+    /// (`ducklake:md:__ducklake_metadata_<database>`) instead of a native
+    /// MotherDuck database (`md:<database>`). Defaults to `false` (native).
+    #[serde(default)]
+    pub use_ducklake: bool,
+    /// PostgreSQL URL backing ETL replay-epoch bookkeeping. MotherDuck exposes
+    /// no PostgreSQL endpoint of its own, so a separate catalog is required.
+    pub metadata_catalog_url: SecretString,
+    /// Schema for ETL bookkeeping tables. Must be unique per destination; when
+    /// omitted a per-database schema is derived so distinct destinations
+    /// sharing one `metadata_catalog_url` never collide.
+    #[serde(default)]
+    pub metadata_schema: Option<String>,
+    /// Size of the DuckDB connection pool.
+    #[serde(default = "default_ducklake_pool_size")]
+    pub pool_size: u32,
+}
+
+/// Same as [`MotherDuckConfig`] but without secrets, so it is safe to
+/// [`Serialize`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MotherDuckConfigWithoutSecrets {
+    /// MotherDuck database name.
+    pub database: String,
+    /// Whether a MotherDuck-managed DuckLake is targeted.
+    pub use_ducklake: bool,
+    /// Schema for ETL bookkeeping tables.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata_schema: Option<String>,
+    /// Size of the DuckDB connection pool.
+    #[serde(default = "default_ducklake_pool_size")]
+    pub pool_size: u32,
+}
+
+impl From<MotherDuckConfig> for MotherDuckConfigWithoutSecrets {
+    fn from(value: MotherDuckConfig) -> Self {
+        let MotherDuckConfig {
+            database,
+            use_ducklake,
+            metadata_catalog_url: _,
+            metadata_schema,
+            pool_size,
+        } = value;
+        MotherDuckConfigWithoutSecrets { database, use_ducklake, metadata_schema, pool_size }
+    }
+}
+
 /// Supported product destination kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -153,26 +214,11 @@ pub enum DestinationConfig {
         /// DuckLake catalog URL.
         ///
         /// A PostgreSQL URL (`postgres://…`) or local `file:` catalog for a
-        /// self-hosted DuckLake, or a MotherDuck-managed catalog of the form
-        /// `md:__ducklake_metadata_<database>`. When a MotherDuck catalog is
-        /// used, DuckLake storage is managed by MotherDuck and no `data_path`
-        /// or S3 credentials are required.
+        /// self-hosted DuckLake.
         catalog_url: SecretString,
-        /// Optional PostgreSQL URL backing the DuckLake metadata bookkeeping
-        /// (the replay-epoch catalog).
-        ///
-        /// Required when [`DestinationConfig::Ducklake::catalog_url`] points at
-        /// a MotherDuck-managed (`md:`) DuckLake, which exposes no PostgreSQL
-        /// endpoint of its own. Ignored for PostgreSQL catalogs, where the
-        /// catalog URL itself backs the metadata pool.
-        #[serde(default)]
-        metadata_catalog_url: Option<SecretString>,
         /// DuckLake data path.
         ///
-        /// Object-storage or `file:` location for Parquet data in a self-hosted
-        /// DuckLake. Left empty for MotherDuck-managed catalogs, which own their
-        /// storage.
-        #[serde(default)]
+        /// Object-storage or `file:` location for Parquet data.
         data_path: String,
         /// Size of the DuckDB connection pool.
         #[serde(default = "default_ducklake_pool_size")]
@@ -198,12 +244,18 @@ pub enum DestinationConfig {
         /// External maintenance coordination backend.
         #[serde(default)]
         maintenance_mode: DuckLakeMaintenanceMode,
-        /// For MotherDuck (`md:`) catalogs, target a managed DuckLake instead of
-        /// a native MotherDuck database. Ignored for `postgres`/`file` catalogs
-        /// (always DuckLake). Defaults to `false` (native MotherDuck database).
-        #[serde(default)]
-        motherduck_use_ducklake: bool,
     },
+    /// MotherDuck destination (fork extension).
+    ///
+    /// Replicates into a MotherDuck database — either a native MotherDuck
+    /// database (`ATTACH 'md:<database>'`, the default) or a MotherDuck-managed
+    /// DuckLake (`ATTACH 'ducklake:md:__ducklake_metadata_<database>'`). This
+    /// is a fork-only variant kept separate from
+    /// [`DestinationConfig::Ducklake`] so upstream DuckLake code stays
+    /// untouched and merges cleanly. The MotherDuck access token is read
+    /// from the `motherduck_token` environment variable.
+    #[serde(rename = "motherduck")]
+    MotherDuck(MotherDuckConfig),
     Snowflake {
         /// Snowflake account identifier in "ORGNAME-ACCOUNTNAME" format.
         account_id: String,
@@ -235,6 +287,9 @@ impl DestinationConfig {
             DestinationConfig::ClickHouse { .. } => DestinationKind::ClickHouse,
             DestinationConfig::Iceberg { .. } => DestinationKind::Iceberg,
             DestinationConfig::Ducklake { .. } => DestinationKind::Ducklake,
+            // MotherDuck reuses the DuckLake destination kind for metrics/tags
+            // and resource sizing; it is a fork extension of the same family.
+            DestinationConfig::MotherDuck(_) => DestinationKind::Ducklake,
             DestinationConfig::Snowflake { .. } => DestinationKind::Snowflake,
         }
     }
@@ -424,12 +479,10 @@ pub enum DestinationConfigWithoutSecrets {
         /// External maintenance coordination backend.
         #[serde(default)]
         maintenance_mode: DuckLakeMaintenanceMode,
-        /// For MotherDuck (`md:`) catalogs, target a managed DuckLake instead of
-        /// a native MotherDuck database. Ignored for `postgres`/`file` catalogs
-        /// (always DuckLake). Defaults to `false` (native MotherDuck database).
-        #[serde(default)]
-        motherduck_use_ducklake: bool,
     },
+    /// MotherDuck destination (fork extension). See [`MotherDuckConfig`].
+    #[serde(rename = "motherduck")]
+    MotherDuck(MotherDuckConfigWithoutSecrets),
     Snowflake {
         /// Snowflake account identifier in "ORGNAME-ACCOUNTNAME" format.
         account_id: String,
@@ -468,7 +521,6 @@ impl From<DestinationConfig> for DestinationConfigWithoutSecrets {
             }
             DestinationConfig::Ducklake {
                 catalog_url: _,
-                metadata_catalog_url: _,
                 data_path,
                 pool_size,
                 s3_access_key_id: _,
@@ -481,7 +533,6 @@ impl From<DestinationConfig> for DestinationConfigWithoutSecrets {
                 maintenance_target_file_size,
                 expire_snapshots_older_than,
                 maintenance_mode,
-                motherduck_use_ducklake,
             } => DestinationConfigWithoutSecrets::Ducklake {
                 data_path,
                 pool_size,
@@ -493,8 +544,10 @@ impl From<DestinationConfig> for DestinationConfigWithoutSecrets {
                 maintenance_target_file_size,
                 expire_snapshots_older_than,
                 maintenance_mode,
-                motherduck_use_ducklake,
             },
+            DestinationConfig::MotherDuck(config) => {
+                DestinationConfigWithoutSecrets::MotherDuck(config.into())
+            }
             DestinationConfig::Snowflake {
                 account_id,
                 user,
@@ -522,7 +575,6 @@ mod tests {
     fn ducklake_without_secrets_omits_catalog_url() {
         let config = DestinationConfig::Ducklake {
             catalog_url: "postgres://user:pass@localhost:5432/ducklake_catalog".to_owned().into(),
-            metadata_catalog_url: None,
             data_path: "s3://bucket/path".to_owned(),
             pool_size: 4,
             s3_access_key_id: None,
@@ -535,7 +587,6 @@ mod tests {
             maintenance_target_file_size: None,
             expire_snapshots_older_than: None,
             maintenance_mode: DuckLakeMaintenanceMode::Kubernetes,
-            motherduck_use_ducklake: false,
         };
 
         let without_secrets = DestinationConfigWithoutSecrets::from(config);
@@ -544,6 +595,49 @@ mod tests {
 
         assert!(!serialized.contains("catalog_url"));
         assert!(!serialized.contains("user:pass"));
+    }
+
+    #[test]
+    fn motherduck_without_secrets_omits_metadata_catalog_url() {
+        let config = DestinationConfig::MotherDuck(MotherDuckConfig {
+            database: "analytics".to_owned(),
+            use_ducklake: false,
+            metadata_catalog_url: "postgres://user:pass@localhost:5432/bookkeeping"
+                .to_owned()
+                .into(),
+            metadata_schema: None,
+            pool_size: 4,
+        });
+
+        let without_secrets = DestinationConfigWithoutSecrets::from(config);
+        let json = serde_json::to_value(without_secrets).unwrap();
+        let serialized = json.to_string();
+
+        assert!(!serialized.contains("metadata_catalog_url"));
+        assert!(!serialized.contains("user:pass"));
+        assert!(serialized.contains("analytics"));
+    }
+
+    #[test]
+    fn motherduck_config_deserializes_from_snake_case() {
+        let json = serde_json::json!({
+            "motherduck": {
+                "database": "etl_ducklake_s3",
+                "use_ducklake": true,
+                "metadata_catalog_url": "postgres://u:p@h:5432/db",
+                "metadata_schema": "etl_meta"
+            }
+        });
+        let config: DestinationConfig = serde_json::from_value(json).unwrap();
+        match config {
+            DestinationConfig::MotherDuck(md) => {
+                assert_eq!(md.database, "etl_ducklake_s3");
+                assert!(md.use_ducklake);
+                assert_eq!(md.metadata_schema.as_deref(), Some("etl_meta"));
+                assert_eq!(md.pool_size, DestinationConfig::DEFAULT_DUCKLAKE_POOL_SIZE);
+            }
+            other => panic!("expected MotherDuck, got {other:?}"),
+        }
     }
 
     #[test]

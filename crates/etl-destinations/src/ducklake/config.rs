@@ -56,13 +56,13 @@ const DUCKDB_MAX_TEMP_DIRECTORY_SIZE_ENV_VAR: &str = "ETL_DUCKDB_MAX_TEMP_DIRECT
 /// unless `temp_directory` is set. Without a spill directory a single large
 /// operation (a large batch, a whole-table update, or DuckLake compaction) can
 /// exhaust memory instead of spilling. The directory defaults to a subdirectory
-/// of the system temp dir and can be overridden with `ETL_DUCKDB_TEMP_DIRECTORY`.
-/// `ETL_DUCKDB_MEMORY_LIMIT` and `ETL_DUCKDB_MAX_TEMP_DIRECTORY_SIZE` are applied
-/// only when set, so DuckDB's own defaults otherwise apply.
+/// of the system temp dir and can be overridden with
+/// `ETL_DUCKDB_TEMP_DIRECTORY`. `ETL_DUCKDB_MEMORY_LIMIT` and
+/// `ETL_DUCKDB_MAX_TEMP_DIRECTORY_SIZE` are applied only when set, so DuckDB's
+/// own defaults otherwise apply.
 fn configure_resource_limits_sql() -> String {
     let temp_directory = env::var(DUCKDB_TEMP_DIRECTORY_ENV_VAR)
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| env::temp_dir().join("etl_duckdb_spill"));
+        .map_or_else(|_| env::temp_dir().join("etl_duckdb_spill"), PathBuf::from);
     let temp_directory = temp_directory.to_string_lossy().into_owned();
 
     let mut sql = format!("SET temp_directory = {};", quote_literal(&temp_directory));
@@ -682,18 +682,26 @@ fn build_setup_sql_with_strategy(
 
 /// Directory used for on-demand DuckDB extension installs in environments where
 /// the default home-relative extension directory may not be writable.
-const MOTHERDUCK_EXTENSION_DIRECTORY: &str = "/tmp/duckdb_extensions";
-
-/// Extracts the MotherDuck database name from a `md:` catalog URL.
 ///
-/// Accepts `md:<db>` (native database or DuckLake) and the legacy
-/// `md:__ducklake_metadata_<db>` form, returning `<db>` in both cases.
+/// Honors `ETL_DUCKDB_EXTENSION_ROOT` when set; otherwise a per-user
+/// subdirectory of the platform temp directory. Avoids a fixed, world-writable
+/// path such as `/tmp/duckdb_extensions`, which a co-tenant on a shared host
+/// could pre-create or seed with stale extensions.
+fn motherduck_extension_directory() -> String {
+    if let Some(root) = env::var_os(DUCKDB_EXTENSION_ROOT_ENV_VAR) {
+        return PathBuf::from(root).to_string_lossy().into_owned();
+    }
+    env::temp_dir().join("etl_duckdb_extensions").to_string_lossy().into_owned()
+}
+
+/// Extracts the MotherDuck database name from a `md:<database>` catalog URL.
+///
+/// The catalog URL is constructed from a bare, typed database name upstream, so
+/// this only strips the `md:` / `motherduck:` scheme. It intentionally does not
+/// strip a `__ducklake_metadata_` prefix: a native database legitimately named
+/// that must not be silently redirected to a different database.
 pub(super) fn motherduck_database_name(catalog_url: &Url) -> String {
-    let raw = catalog_url
-        .as_str()
-        .trim_start_matches("motherduck:")
-        .trim_start_matches("md:");
-    raw.strip_prefix("__ducklake_metadata_").unwrap_or(raw).to_owned()
+    catalog_url.as_str().trim_start_matches("motherduck:").trim_start_matches("md:").to_owned()
 }
 
 /// Builds the setup plan for a MotherDuck destination.
@@ -717,12 +725,12 @@ fn build_motherduck_setup_plan(
         format!(
             "SET extension_directory = {}; INSTALL ducklake; LOAD ducklake; INSTALL motherduck; \
              LOAD motherduck;",
-            quote_literal(MOTHERDUCK_EXTENSION_DIRECTORY)
+            quote_literal(&motherduck_extension_directory())
         )
     } else {
         format!(
             "SET extension_directory = {}; INSTALL motherduck; LOAD motherduck;",
-            quote_literal(MOTHERDUCK_EXTENSION_DIRECTORY)
+            quote_literal(&motherduck_extension_directory())
         )
     };
 
@@ -1474,18 +1482,14 @@ mod tests {
     }
 
     #[test]
-    fn motherduck_database_name_parses_native_and_legacy_forms() {
-        assert_eq!(
-            motherduck_database_name(&Url::parse("md:my_db").unwrap()),
-            "my_db"
-        );
-        assert_eq!(
-            motherduck_database_name(&Url::parse("motherduck:my_db").unwrap()),
-            "my_db"
-        );
+    fn motherduck_database_name_strips_only_the_scheme() {
+        assert_eq!(motherduck_database_name(&Url::parse("md:my_db").unwrap()), "my_db");
+        assert_eq!(motherduck_database_name(&Url::parse("motherduck:my_db").unwrap()), "my_db");
+        // A native database literally named `__ducklake_metadata_my_db` must be
+        // preserved verbatim, not silently redirected to `my_db`.
         assert_eq!(
             motherduck_database_name(&Url::parse("md:__ducklake_metadata_my_db").unwrap()),
-            "my_db"
+            "__ducklake_metadata_my_db"
         );
     }
 

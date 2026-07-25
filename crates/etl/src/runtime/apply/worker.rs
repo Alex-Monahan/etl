@@ -351,12 +351,24 @@ const FAILOVER_SLOT_ENV_VAR: &str = "ETL_FAILOVER_SLOT";
 /// Returns whether failover slots are enabled.
 ///
 /// Defaults to `true` so slot loss on a source promotion is handled out of the
-/// box; set `ETL_FAILOVER_SLOT` to `0`/`false`/`no`/`off` to opt out.
+/// box; set `ETL_FAILOVER_SLOT` to a falsey value (`0`, `false`, `no`, `off`,
+/// case-insensitive, surrounding whitespace ignored) to opt out. An
+/// unrecognized value logs a warning and leaves the feature enabled.
 fn failover_slots_enabled() -> bool {
-    !matches!(
-        std::env::var(FAILOVER_SLOT_ENV_VAR).ok().as_deref(),
-        Some("0" | "false" | "FALSE" | "no" | "off")
-    )
+    let Ok(raw) = std::env::var(FAILOVER_SLOT_ENV_VAR) else {
+        return true;
+    };
+    let value = raw.trim();
+    if matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off" | "n" | "f") {
+        return false;
+    }
+    if !matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on" | "y" | "t") {
+        warn!(
+            value = %raw,
+            "unrecognized {FAILOVER_SLOT_ENV_VAR} value; leaving failover slots enabled"
+        );
+    }
+    true
 }
 
 /// Marks the apply slot as a failover slot when enabled and supported by the
@@ -371,12 +383,11 @@ async fn ensure_failover_slot(replication_client: &PgReplicationClient, slot_nam
 
     match replication_client.set_slot_failover(slot_name).await {
         Ok(true) => info!(slot_name, "configured apply worker slot as a failover slot"),
-        Ok(false) => debug!(
-            slot_name,
-            "failover slots enabled but source PostgreSQL is < 17; skipping"
-        ),
+        Ok(false) => {
+            debug!(slot_name, "failover slots enabled but source PostgreSQL is < 17; skipping");
+        }
         Err(err) => {
-            warn!(slot_name, error = %err, "failed to configure apply worker failover slot")
+            warn!(slot_name, error = %err, "failed to configure apply worker failover slot");
         }
     }
 }
@@ -515,7 +526,7 @@ async fn get_start_lsn<S: StateStore + TableStateLifecycleStore>(
 /// - [`InvalidatedSlotBehavior::Recreate`]: Deletes the slot, resets all table
 ///   states to Init, deletes stale apply progress, and creates a new slot,
 ///   returning its consistent point LSN
-async fn handle_invalidated_slot<S: TableStateLifecycleStore>(
+async fn handle_invalidated_slot<S: StateStore + TableStateLifecycleStore>(
     pipeline_id: PipelineId,
     replication_client: &PgReplicationClient,
     store: &S,
@@ -544,6 +555,12 @@ async fn handle_invalidated_slot<S: TableStateLifecycleStore>(
                 pipeline_id,
                 "replication slot is invalidated, resetting all table states and recreating slot"
             );
+
+            // Surface tables that had already completed their sync: recreating
+            // the slot re-copies them from a fresh snapshot, but any table that
+            // the copy policy skips would otherwise silently miss the changes
+            // between the old slot stopping and the new slot starting.
+            warn_if_tables_may_have_missed_changes(store).await?;
 
             let reset_count = store.reset_table_states_for_resync().await?;
 
