@@ -151,8 +151,23 @@ pub enum DestinationConfig {
     },
     Ducklake {
         /// DuckLake catalog URL.
+        ///
+        /// A PostgreSQL (`postgres://…`) or `file:` catalog for a self-hosted
+        /// DuckLake, or a MotherDuck database (`md:<database>`) to replicate into
+        /// a native MotherDuck database.
         catalog_url: SecretString,
+        /// PostgreSQL URL backing the replay-epoch bookkeeping catalog.
+        ///
+        /// Required only when `catalog_url` is a MotherDuck (`md:`) database,
+        /// which exposes no PostgreSQL endpoint of its own. Ignored for
+        /// PostgreSQL catalogs, where the catalog URL itself backs the pool.
+        #[serde(default)]
+        metadata_catalog_url: Option<SecretString>,
         /// DuckLake data path.
+        ///
+        /// Object-storage or `file:` location for Parquet data in a self-hosted
+        /// DuckLake. Left empty for MotherDuck databases, which own their storage.
+        #[serde(default)]
         data_path: String,
         /// Size of the DuckDB connection pool.
         #[serde(default = "default_ducklake_pool_size")]
@@ -438,6 +453,7 @@ impl From<DestinationConfig> for DestinationConfigWithoutSecrets {
             }
             DestinationConfig::Ducklake {
                 catalog_url: _,
+                metadata_catalog_url: _,
                 data_path,
                 pool_size,
                 s3_access_key_id: _,
@@ -489,6 +505,7 @@ mod tests {
     fn ducklake_without_secrets_omits_catalog_url() {
         let config = DestinationConfig::Ducklake {
             catalog_url: "postgres://user:pass@localhost:5432/ducklake_catalog".to_owned().into(),
+            metadata_catalog_url: None,
             data_path: "s3://bucket/path".to_owned(),
             pool_size: 4,
             s3_access_key_id: None,
