@@ -1300,11 +1300,6 @@ where
         }
         // A native MotherDuck database manages its own storage and maintenance, so
         // external maintenance coordination never applies.
-        let external_maintenance = if is_motherduck {
-            DuckLakeExternalMaintenanceConfig::disabled()
-        } else {
-            external_maintenance
-        };
         match external_maintenance.mode {
             DuckLakeMaintenanceMode::Disabled => {
                 info!("ducklake external maintenance watcher disabled by configuration");
