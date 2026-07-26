@@ -1103,6 +1103,9 @@ impl StoredDestinationConfig {
                 maintenance_mode,
             } => DestinationConfig::Ducklake {
                 catalog_url: catalog_url.into(),
+                // The API does not expose a MotherDuck catalog, so there is no
+                // separate metadata catalog URL to carry through.
+                metadata_catalog_url: None,
                 data_path,
                 pool_size,
                 s3_access_key_id: s3_access_key_id.map(Into::into),

@@ -201,6 +201,7 @@ mod ducklake {
 
         let DestinationConfig::Ducklake {
             catalog_url,
+            metadata_catalog_url,
             data_path,
             pool_size,
             s3_access_key_id,
@@ -216,6 +217,25 @@ mod ducklake {
         } = &replicator_config.destination
         else {
             unreachable!("Destination kind should match DuckLake config");
+        };
+
+        let catalog_url =
+            parse_ducklake_url(catalog_url.expose_secret()).map_err(ReplicatorError::config)?;
+
+        // A MotherDuck (`md:`) catalog is a native MotherDuck database. It has no
+        // PostgreSQL endpoint of its own, so replay-epoch bookkeeping is backed by
+        // a separately provided PostgreSQL metadata catalog, and it manages its own
+        // storage so the data path is unused (a placeholder is passed).
+        let is_motherduck = matches!(catalog_url.scheme(), "md" | "motherduck");
+        let metadata_catalog_url = metadata_catalog_url
+            .as_ref()
+            .map(|url| parse_ducklake_url(url.expose_secret()))
+            .transpose()
+            .map_err(ReplicatorError::config)?;
+        let data_path = if is_motherduck {
+            parse_ducklake_url("md:managed").map_err(ReplicatorError::config)?
+        } else {
+            parse_ducklake_s3_data_path(data_path).map_err(ReplicatorError::config)?
         };
 
         let s3_config = match (s3_access_key_id, s3_secret_access_key) {
@@ -246,8 +266,9 @@ mod ducklake {
             DuckLakeExternalMaintenanceConfig { mode: maintenance_mode, pipeline_id };
 
         let destination = DuckLakeDestination::new_with_external_maintenance(
-            parse_ducklake_url(catalog_url.expose_secret()).map_err(ReplicatorError::config)?,
-            parse_ducklake_s3_data_path(data_path).map_err(ReplicatorError::config)?,
+            catalog_url,
+            metadata_catalog_url,
+            data_path,
             *pool_size,
             s3_config,
             metadata_schema.clone(),

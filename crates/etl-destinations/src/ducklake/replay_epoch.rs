@@ -30,6 +30,19 @@ pub(super) async fn ensure_replay_epoch_table_exists(
     pool: &PgPool,
     metadata_schema: &str,
 ) -> EtlResult<()> {
+    // The bookkeeping schema is not necessarily `public`: a MotherDuck metadata
+    // catalog may point the replay-epoch table at a schema that does not exist
+    // yet, so create it before the table.
+    let create_schema =
+        format!("create schema if not exists {};", quote_identifier(metadata_schema));
+    sqlx::query(AssertSqlSafe(create_schema)).execute(pool).await.map_err(|source| {
+        etl_error!(
+            ErrorKind::DestinationQueryFailed,
+            "DuckLake replay epoch schema creation failed",
+            source: source
+        )
+    })?;
+
     let table_name = replay_epochs_table_name(metadata_schema);
     let sql = format!(
         r#"create table if not exists {table_name} (

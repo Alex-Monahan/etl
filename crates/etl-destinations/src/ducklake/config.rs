@@ -636,6 +636,49 @@ fn build_setup_sql_with_strategy(
     .combined_sql())
 }
 
+/// Extracts the MotherDuck database name from a `md:<database>` catalog URL.
+///
+/// Only strips the `md:` / `motherduck:` scheme; the remainder is the database
+/// name verbatim.
+pub(super) fn motherduck_database_name(catalog_url: &Url) -> String {
+    catalog_url.as_str().trim_start_matches("motherduck:").trim_start_matches("md:").to_owned()
+}
+
+/// Directory for on-demand DuckDB extension installs (the `motherduck`
+/// extension is not vendored), under a per-user temp dir.
+fn motherduck_extension_directory() -> String {
+    env::temp_dir().join("etl_duckdb_extensions").to_string_lossy().into_owned()
+}
+
+/// Builds the setup plan for a native MotherDuck database
+/// (`ATTACH 'md:<database>' AS lake`).
+///
+/// MotherDuck is not a DuckLake: no DATA_PATH, data inlining, Parquet settings,
+/// or object-store secret are configured. Authentication uses the
+/// `motherduck_token` environment variable read by the `motherduck` extension.
+fn build_motherduck_setup_plan(catalog_url: &Url) -> EtlResult<DuckLakeSetupPlan> {
+    let lake_catalog = quote_identifier(LAKE_CATALOG);
+    let db = motherduck_database_name(catalog_url);
+    let steps = vec![
+        DuckLakeSetupStep {
+            label: "configure_writer_session",
+            sql: configure_writer_session_sql(),
+        },
+        DuckLakeSetupStep {
+            label: "load_extensions",
+            sql: format!(
+                "SET extension_directory = {}; INSTALL motherduck; LOAD motherduck;",
+                quote_literal(&motherduck_extension_directory())
+            ),
+        },
+        DuckLakeSetupStep {
+            label: "attach_catalog",
+            sql: format!("ATTACH {} AS {lake_catalog};", quote_literal(&format!("md:{db}"))),
+        },
+    ];
+    Ok(DuckLakeSetupPlan { steps })
+}
+
 fn build_setup_plan_with_strategy(
     catalog_url: &Url,
     data_path: &Url,
@@ -645,6 +688,12 @@ fn build_setup_plan_with_strategy(
     vendored_root: Option<&Path>,
     data_inlining_row_limit: u64,
 ) -> EtlResult<DuckLakeSetupPlan> {
+    // A MotherDuck (`md:`) catalog is a native MotherDuck database, not a
+    // DuckLake; it uses a distinct, minimal attach with no data path/Parquet.
+    if matches!(catalog_url.scheme(), "md" | "motherduck") {
+        return build_motherduck_setup_plan(catalog_url);
+    }
+
     let catalog_target = catalog_attach_target(catalog_url)?;
     let data_path = validate_data_path(data_path)?;
 

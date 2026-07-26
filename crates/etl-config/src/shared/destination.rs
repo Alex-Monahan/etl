@@ -153,8 +153,8 @@ pub enum DestinationConfig {
         /// DuckLake catalog URL.
         ///
         /// A PostgreSQL (`postgres://…`) or `file:` catalog for a self-hosted
-        /// DuckLake, or a MotherDuck database (`md:<database>`) to replicate into
-        /// a native MotherDuck database.
+        /// DuckLake, or a MotherDuck database (`md:<database>`) to replicate
+        /// into a native MotherDuck database.
         catalog_url: SecretString,
         /// PostgreSQL URL backing the replay-epoch bookkeeping catalog.
         ///
@@ -166,7 +166,8 @@ pub enum DestinationConfig {
         /// DuckLake data path.
         ///
         /// Object-storage or `file:` location for Parquet data in a self-hosted
-        /// DuckLake. Left empty for MotherDuck databases, which own their storage.
+        /// DuckLake. Left empty for MotherDuck databases, which own their
+        /// storage.
         #[serde(default)]
         data_path: String,
         /// Size of the DuckDB connection pool.

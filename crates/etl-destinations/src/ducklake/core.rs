@@ -174,6 +174,10 @@ pub struct DuckLakeDestination<S> {
     metrics_sampler: Arc<Option<DuckLakeMetricsSampler>>,
     metadata_schema: Arc<str>,
     expire_snapshots_older_than: Arc<str>,
+    /// Whether the destination is a DuckLake catalog rather than a native
+    /// MotherDuck database. Native MotherDuck skips DuckLake-only helper-table
+    /// options such as per-table `data_inlining_row_limit`.
+    is_ducklake: bool,
     metadata_pg_pool: PgPool,
     table_creation_slots: Arc<Semaphore>,
     table_write_slots: Arc<Mutex<HashMap<DuckLakeTableName, Arc<Semaphore>>>>,
@@ -1013,6 +1017,10 @@ where
     ) -> EtlResult<Self> {
         Self::new_with_external_maintenance(
             catalog_url,
+            // `new` targets a self-hosted / managed DuckLake catalog, which backs
+            // its own replay-epoch metadata pool; a native MotherDuck database is
+            // reached only through `new_with_external_maintenance`.
+            None,
             data_path,
             pool_size,
             s3,
@@ -1030,6 +1038,7 @@ where
     #[allow(clippy::too_many_arguments)]
     pub async fn new_with_external_maintenance(
         catalog_url: Url,
+        metadata_catalog_url: Option<Url>,
         data_path: Url,
         pool_size: u32,
         s3: Option<S3Config>,
@@ -1041,13 +1050,42 @@ where
     ) -> EtlResult<Self> {
         register_metrics();
 
-        if !matches!(catalog_url.scheme(), "postgres" | "postgresql") {
+        // A MotherDuck catalog (`md:<db>`) is a native MotherDuck database rather
+        // than a DuckLake catalog. It has no PostgreSQL endpoint of its own, so
+        // the replay-epoch metadata pool is backed by a separately provided
+        // PostgreSQL URL, and all DuckLake-only setup is skipped.
+        let is_motherduck = matches!(catalog_url.scheme(), "md" | "motherduck");
+        let is_ducklake = !is_motherduck;
+
+        if !matches!(catalog_url.scheme(), "postgres" | "postgresql" | "md" | "motherduck") {
             return Err(etl_error!(
                 ErrorKind::ConfigError,
-                "DuckLake destination requires a PostgreSQL catalog URL",
+                "DuckLake destination requires a PostgreSQL or MotherDuck catalog URL",
                 format!("unsupported catalog URL scheme `{}`", catalog_url.scheme())
             ));
         }
+
+        // The pool backing replay-epoch bookkeeping. A DuckLake catalog is itself
+        // PostgreSQL; a MotherDuck database requires an explicit metadata URL.
+        let metadata_pg_url = if is_motherduck {
+            let url = metadata_catalog_url.ok_or_else(|| {
+                etl_error!(
+                    ErrorKind::ConfigError,
+                    "MotherDuck catalog requires a metadata catalog URL",
+                    "Set `metadata_catalog_url` to a PostgreSQL URL for replay-epoch bookkeeping"
+                )
+            })?;
+            if !matches!(url.scheme(), "postgres" | "postgresql") {
+                return Err(etl_error!(
+                    ErrorKind::ConfigError,
+                    "DuckLake metadata catalog URL must be a PostgreSQL URL",
+                    format!("unsupported metadata catalog URL scheme `{}`", url.scheme())
+                ));
+            }
+            url
+        } else {
+            catalog_url.clone()
+        };
 
         if pool_size == 0 {
             return Err(etl_error!(
@@ -1110,62 +1148,73 @@ where
             Arc::new(build_warm_ducklake_pool(manager.as_ref().clone(), pool_size, "write").await?);
         let blocking_slots = Arc::new(Semaphore::new(pool_size as usize));
 
-        // `target_file_size` is a catalog-wide DuckLake option consumed during
-        // compaction. Apply it once on the write pool so foreground writes and
-        // external maintenance jobs use the same configured catalog option.
-        let target_file_size_sql =
-            maintenance_target_file_size_sql(Some(maintenance_target_file_size.as_ref()));
-        run_duckdb_blocking(
-            Arc::clone(&pool),
-            Arc::clone(&blocking_slots),
-            move |conn| -> EtlResult<()> {
-                conn.execute_batch(&target_file_size_sql).map_err(|error| {
-                    etl_error!(
-                        ErrorKind::DestinationQueryFailed,
-                        "DuckLake target_file_size configuration failed",
-                        source: error
-                    )
-                })?;
-                Ok(())
-            },
-        )
-        .await?;
-        let expire_snapshots_validation_sql =
-            validate_expire_snapshots_older_than_sql(expire_snapshots_older_than.as_ref());
-        let expire_snapshots_older_than_for_error = Arc::clone(&expire_snapshots_older_than);
-        run_duckdb_blocking(
-            Arc::clone(&pool),
-            Arc::clone(&blocking_slots),
-            move |conn| -> EtlResult<()> {
-                let retention_is_safe: bool = conn
-                    .query_row(&expire_snapshots_validation_sql, [], |row| row.get(0))
-                    .map_err(|source| {
+        // `target_file_size` and `expire_snapshots_older_than` are DuckLake-only
+        // catalog options; a native MotherDuck database has neither, so skip this
+        // whole setup block for native mode.
+        if is_ducklake {
+            // `target_file_size` is a catalog-wide DuckLake option consumed during
+            // compaction. Apply it once on the write pool so foreground writes and
+            // external maintenance jobs use the same configured catalog option.
+            let target_file_size_sql =
+                maintenance_target_file_size_sql(Some(maintenance_target_file_size.as_ref()));
+            run_duckdb_blocking(
+                Arc::clone(&pool),
+                Arc::clone(&blocking_slots),
+                move |conn| -> EtlResult<()> {
+                    conn.execute_batch(&target_file_size_sql).map_err(|error| {
                         etl_error!(
+                            ErrorKind::DestinationQueryFailed,
+                            "DuckLake target_file_size configuration failed",
+                            source: error
+                        )
+                    })?;
+                    Ok(())
+                },
+            )
+            .await?;
+            let expire_snapshots_validation_sql =
+                validate_expire_snapshots_older_than_sql(expire_snapshots_older_than.as_ref());
+            let expire_snapshots_older_than_for_error = Arc::clone(&expire_snapshots_older_than);
+            run_duckdb_blocking(
+                Arc::clone(&pool),
+                Arc::clone(&blocking_slots),
+                move |conn| -> EtlResult<()> {
+                    let retention_is_safe: bool = conn
+                        .query_row(&expire_snapshots_validation_sql, [], |row| row.get(0))
+                        .map_err(|source| {
+                            etl_error!(
+                                ErrorKind::ConfigError,
+                                "DuckLake expire_snapshots_older_than configuration failed",
+                                format!(
+                                    "Invalid expire_snapshots_older_than value `{}`",
+                                    expire_snapshots_older_than_for_error
+                                ),
+                                source: source
+                            )
+                        })?;
+                    if !retention_is_safe {
+                        return Err(etl_error!(
                             ErrorKind::ConfigError,
                             "DuckLake expire_snapshots_older_than configuration failed",
                             format!(
-                                "Invalid expire_snapshots_older_than value `{}`",
+                                "Snapshot retention must be at least {}, got `{}`",
+                                MIN_EXPIRE_SNAPSHOTS_OLDER_THAN,
                                 expire_snapshots_older_than_for_error
-                            ),
-                            source: source
-                        )
-                    })?;
-                if !retention_is_safe {
-                    return Err(etl_error!(
-                        ErrorKind::ConfigError,
-                        "DuckLake expire_snapshots_older_than configuration failed",
-                        format!(
-                            "Snapshot retention must be at least {}, got `{}`",
-                            MIN_EXPIRE_SNAPSHOTS_OLDER_THAN, expire_snapshots_older_than_for_error
-                        )
-                    ));
-                }
-                Ok(())
-            },
-        )
-        .await?;
+                            )
+                        ));
+                    }
+                    Ok(())
+                },
+            )
+            .await?;
+        }
         let metadata_schema = match metadata_schema {
             Some(metadata_schema) => metadata_schema,
+            // A native MotherDuck catalog keeps its DuckLake metadata internal, so
+            // there is no hidden metadata schema to resolve. The schema here only
+            // names where the replay-epoch bookkeeping table lives in the
+            // PostgreSQL metadata catalog; default to `public`.
+            None if is_motherduck => "public".to_owned(),
             None => {
                 run_duckdb_blocking(
                     Arc::clone(&pool),
@@ -1176,7 +1225,7 @@ where
             }
         };
         let metadata_schema = Arc::<str>::from(metadata_schema);
-        let metadata_pg_pool = build_ducklake_metadata_pg_pool(&catalog_url)?;
+        let metadata_pg_pool = build_ducklake_metadata_pg_pool(&metadata_pg_url)?;
         ensure_replay_epoch_table_exists(&metadata_pg_pool, metadata_schema.as_ref()).await?;
         let table_creation_slots = Arc::new(Semaphore::new(1));
         let applied_batches_table_created = Arc::new(AtomicBool::new(false));
@@ -1191,6 +1240,7 @@ where
             Arc::clone(&blocking_slots),
             Arc::clone(&table_creation_slots),
             Arc::clone(&applied_batches_table_created),
+            is_ducklake,
         )
         .await?;
         ensure_streaming_progress_table_exists(
@@ -1198,6 +1248,7 @@ where
             Arc::clone(&blocking_slots),
             Arc::clone(&table_creation_slots),
             Arc::clone(&streaming_progress_table_created),
+            is_ducklake,
         )
         .await?;
 
@@ -1216,6 +1267,7 @@ where
             metrics_sampler: Arc::new(None),
             metadata_schema: Arc::clone(&metadata_schema),
             expire_snapshots_older_than: Arc::clone(&expire_snapshots_older_than),
+            is_ducklake,
             metadata_pg_pool: metadata_pg_pool.clone(),
             table_creation_slots,
             table_write_slots: Arc::default(),
@@ -1232,14 +1284,27 @@ where
                 interrupt_duckdb_connections_on_process_shutdown(shutdown_signal_manager).await;
             })
             .await;
-        destination.metrics_sampler = Arc::new(
-            spawn_ducklake_metrics_sampler(
-                metadata_schema.to_string(),
-                metadata_pg_pool.clone(),
-                Arc::clone(&created_tables),
-            )?
-            .into(),
-        );
+        // The metrics sampler reads DuckLake's internal catalog tables through the
+        // PostgreSQL metadata pool. A native MotherDuck database keeps those tables
+        // inside MotherDuck rather than the metadata PostgreSQL, so the sampler has
+        // nothing to query there and is left disabled.
+        if is_ducklake {
+            destination.metrics_sampler = Arc::new(
+                spawn_ducklake_metrics_sampler(
+                    metadata_schema.to_string(),
+                    metadata_pg_pool.clone(),
+                    Arc::clone(&created_tables),
+                )?
+                .into(),
+            );
+        }
+        // A native MotherDuck database manages its own storage and maintenance, so
+        // external maintenance coordination never applies.
+        let external_maintenance = if is_motherduck {
+            DuckLakeExternalMaintenanceConfig::disabled()
+        } else {
+            external_maintenance
+        };
         match external_maintenance.mode {
             DuckLakeMaintenanceMode::Disabled => {
                 info!("ducklake external maintenance watcher disabled by configuration");
@@ -2413,6 +2478,7 @@ where
             Arc::clone(&self.blocking_slots),
             Arc::clone(&self.table_creation_slots),
             Arc::clone(&self.applied_batches_table_created),
+            self.is_ducklake,
         )
         .await
     }
@@ -2425,6 +2491,7 @@ where
             Arc::clone(&self.blocking_slots),
             Arc::clone(&self.table_creation_slots),
             Arc::clone(&self.streaming_progress_table_created),
+            self.is_ducklake,
         )
         .await
     }
