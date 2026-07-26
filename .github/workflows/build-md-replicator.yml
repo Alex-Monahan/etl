@@ -1,0 +1,72 @@
+name: Build MD DuckLake Replicator
+
+# Builds a standalone Linux x86_64 `etl-replicator` binary (ducklake feature
+# only) and publishes it as a release asset so a MotherDuck Flight can download
+# and run it against a native MotherDuck database.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - motherduck-minimal
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # Build on an older glibc (Ubuntu 22.04 = glibc 2.35) so the binary runs on
+    # the Flights Debian base image. ubuntu-latest ships a newer glibc that fails
+    # with "GLIBC_2.3x not found" on the Flight.
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libssl-dev \
+            clang \
+            make \
+            cmake \
+            build-essential
+
+      - name: Install Rust toolchain
+        # Honors rust-toolchain.toml (channel 1.95.0).
+        run: rustup show
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build etl-replicator (ducklake only)
+        run: |
+          cargo build --release -p etl-replicator \
+            --no-default-features --features ducklake
+          strip target/release/etl-replicator
+          cp target/release/etl-replicator etl-replicator-linux-amd64
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp etl-replicator-linux-amd64 dist/
+          cd dist
+          gzip -k -9 etl-replicator-linux-amd64
+          sha256sum etl-replicator-linux-amd64* > SHA256SUMS
+          ls -la
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="replicator-md-ducklake"
+          # Recreate the release so the tag always points at this build.
+          gh release delete "$TAG" --yes --cleanup-tag || true
+          gh release create "$TAG" \
+            --title "MotherDuck DuckLake replicator (linux/amd64)" \
+            --notes "etl-replicator built with the ducklake feature for native MotherDuck replication. Commit ${GITHUB_SHA}." \
+            dist/etl-replicator-linux-amd64 \
+            dist/etl-replicator-linux-amd64.gz \
+            dist/SHA256SUMS
