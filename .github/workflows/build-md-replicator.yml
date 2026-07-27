@@ -48,16 +48,40 @@ jobs:
           strip target/release/etl-replicator
           cp target/release/etl-replicator etl-replicator-linux-amd64
 
-      - name: Package binary
+      - name: Package binary and build manifest
+        env:
+          # Recorded into latest.json so a consumer (the MotherDuck Flight
+          # resolver) can verify it is pulling exactly this successful build.
+          BUILD_SHA: ${{ github.sha }}
+          BUILD_RUN_ID: ${{ github.run_id }}
+          BUILD_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           mkdir -p dist
           cp etl-replicator-linux-amd64 dist/
           cd dist
           gzip -k -9 etl-replicator-linux-amd64
-          sha256sum etl-replicator-linux-amd64* > SHA256SUMS
+          # SHA256SUMS is the sha256 of the .gz asset that consumers download.
+          GZ_SHA=$(sha256sum etl-replicator-linux-amd64.gz | awk '{print $1}')
+          sha256sum etl-replicator-linux-amd64.gz > SHA256SUMS
+          # latest.json makes "the latest successful build" explicit + traceable.
+          BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          jq -n \
+            --arg sha "$BUILD_SHA" \
+            --argjson run_id "$BUILD_RUN_ID" \
+            --arg run_url "$BUILD_RUN_URL" \
+            --arg built_at "$BUILT_AT" \
+            --arg asset "etl-replicator-linux-amd64.gz" \
+            --arg sha256 "$GZ_SHA" \
+            '{sha:$sha, run_id:$run_id, run_url:$run_url, built_at:$built_at, asset:$asset, sha256:$sha256}' \
+            > latest.json
+          echo "--- latest.json ---"; cat latest.json
+          echo "--- SHA256SUMS ---"; cat SHA256SUMS
           ls -la
 
       - name: Publish release
+        # Runs only on success (default job flow), so whatever lands in the
+        # release is by definition the latest successful build; latest.json
+        # records the exact sha / run for traceable, verifiable pulls.
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -69,4 +93,5 @@ jobs:
             --notes "etl-replicator built with the ducklake feature for native MotherDuck replication. Commit ${GITHUB_SHA}." \
             dist/etl-replicator-linux-amd64 \
             dist/etl-replicator-linux-amd64.gz \
-            dist/SHA256SUMS
+            dist/SHA256SUMS \
+            dist/latest.json
